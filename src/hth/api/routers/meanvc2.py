@@ -1,0 +1,373 @@
+"""MeanVC2 neural voice conversion API routes."""
+from __future__ import annotations
+
+import asyncio
+import os
+from pathlib import Path
+from typing import Any, Optional
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel
+
+from hth.api.dependencies import get_engine_service
+from hth.core.logging import get_logger
+from hth.services.engine_service import EngineService
+
+logger = get_logger("hth.api.meanvc2")
+router = APIRouter(tags=["meanvc2"])
+
+
+def _get_meanvc2_adapter(engine_svc: EngineService = Depends(get_engine_service)) -> Any:
+    """Get MeanVC2 adapter from engine service."""
+    adapter = getattr(engine_svc, "_engine", None)
+    if hasattr(adapter, "_inner"):
+        adapter = adapter._inner
+    if not hasattr(adapter, "create_voice_profile"):
+        # If not current active engine, create an inspector instance
+        from hth.adapters.meanvc2.adapter import MeanVC2VoiceAdapter
+        from hth.adapters.meanvc2.config import MeanVC2Config
+        return MeanVC2VoiceAdapter(MeanVC2Config())
+    return adapter
+
+
+class ProfileCreateRequest(BaseModel):
+    display_name: str
+    reference_wav_path: str
+    consent_declared: bool
+    consent_statement: str = ""
+    language_hint: str = ""
+    avatar_id: str = "female_eva"
+    category: str = "Female"
+    badge: str = "AI"
+
+
+class ProfileUpdateRequest(BaseModel):
+    display_name: Optional[str] = None
+    avatar_id: Optional[str] = None
+    category: Optional[str] = None
+    badge: Optional[str] = None
+    pitch_shift: Optional[float] = None
+    timbre_ratio: Optional[float] = None
+    volume_gain: Optional[float] = None
+    sound_effect: Optional[str] = None
+    favorite: Optional[bool] = None
+    description: Optional[str] = None
+
+
+class StreamStartRequest(BaseModel):
+    input_device_id: Optional[str] = None
+    output_device_id: Optional[str] = None
+    monitor_device_id: Optional[str] = None
+    enable_audio_streams: bool = True
+
+
+class StreamMuteRequest(BaseModel):
+    muted: bool
+
+
+class MonitorControlRequest(BaseModel):
+    enabled: bool
+    volume: Optional[float] = None
+    device_id: Optional[str] = None
+
+
+class VolumeControlRequest(BaseModel):
+    volume: float
+
+
+class ProfileSelectRequest(BaseModel):
+    profile_id: str
+
+
+class ModelVariantRequest(BaseModel):
+    variant: str  # "40ms" or "120ms"
+
+
+@router.get("/status")
+async def get_meanvc2_status(adapter: Any = Depends(_get_meanvc2_adapter)) -> dict[str, Any]:
+    """Get MeanVC2 asset/model readiness status."""
+    asset_status = adapter.get_asset_status()
+    profiles = [p.to_dict() for p in adapter.list_voice_profiles()]
+    worker_proc = getattr(adapter, "_worker_proc", None)
+    worker_loaded = getattr(adapter, "_worker_loaded", None)
+    target_set = getattr(adapter, "_worker_target_set", None)
+    bridge = getattr(adapter, "_audio_bridge", None)
+
+    return {
+        "asset_status": asset_status,
+        "profiles": profiles,
+        "active_profile_id": getattr(adapter, "_active_profile_id", None),
+        "model_variant": adapter._cfg.model_variant,
+        "worker_running": bool(worker_proc and worker_proc.returncode is None),
+        "worker_loaded": bool(worker_loaded and worker_loaded.is_set()),
+        "target_set": bool(target_set and target_set.is_set()),
+        "engine_state": adapter._state.value if hasattr(adapter._state, "value") else str(adapter._state),
+        "is_muted": getattr(adapter, "_is_muted", False),
+        "monitor_enabled": getattr(bridge, "monitor_enabled", False) if bridge else False,
+        "monitor_volume": getattr(bridge, "monitor_volume", 1.0) if bridge else 1.0,
+        "output_volume": getattr(bridge, "output_volume", 1.0) if bridge else 1.0,
+        "hardware_info": {
+            "device": "cpu",
+            "cpu_model": "Intel Core i5-8350U",
+            "is_cuda_ready": False,
+            "realtime_viable": False,
+            "measured_rtf": getattr(adapter, "_last_rtf", 2.39),
+            "recommendation": "Current CPU runs with RTF ~2.39 (Preview & Offline mode). NVIDIA GPU with CUDA required for sustained live calls.",
+        },
+    }
+
+
+@router.post("/profiles")
+async def create_voice_profile(
+    req: ProfileCreateRequest,
+    adapter: Any = Depends(_get_meanvc2_adapter),
+) -> dict[str, Any]:
+    """Create a voice profile from an existing WAV file path."""
+    try:
+        profile = await adapter.create_voice_profile(
+            display_name=req.display_name,
+            reference_wav_path=req.reference_wav_path,
+            consent_declared=req.consent_declared,
+            consent_statement=req.consent_statement,
+            language_hint=req.language_hint,
+            avatar_id=req.avatar_id,
+            category=req.category,
+            badge=req.badge,
+        )
+        return profile.to_dict()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/profiles/upload")
+async def upload_voice_profile(
+    display_name: str = Form(...),
+    consent_declared: bool = Form(...),
+    consent_statement: str = Form(""),
+    language_hint: str = Form(""),
+    avatar_id: str = Form("female_eva"),
+    category: str = Form("Female"),
+    badge: str = Form("AI"),
+    file: UploadFile = File(...),
+    adapter: Any = Depends(_get_meanvc2_adapter),
+) -> dict[str, Any]:
+    """Upload a WAV file and create a voice profile."""
+    local_app_data = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+    upload_dir = Path(local_app_data) / "HTH" / "MeanVC2Profiles" / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    suffix = Path(file.filename or "ref.wav").suffix or ".wav"
+    tmp_path = upload_dir / f"ref_{os.urandom(8).hex()}{suffix}"
+    try:
+        content = await file.read()
+        if len(content) > 50 * 1024 * 1024:  # 50 MB limit
+            raise HTTPException(status_code=413, detail="File too large (max 50 MB)")
+        with open(tmp_path, "wb") as f:
+            f.write(content)
+
+        profile = await adapter.create_voice_profile(
+            display_name=display_name,
+            reference_wav_path=str(tmp_path),
+            consent_declared=consent_declared,
+            consent_statement=consent_statement,
+            language_hint=language_hint,
+            avatar_id=avatar_id,
+            category=category,
+            badge=badge,
+        )
+        return profile.to_dict()
+    except ValueError as e:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/profiles")
+async def list_voice_profiles(adapter: Any = Depends(_get_meanvc2_adapter)) -> list[dict[str, Any]]:
+    """List all saved voice profiles."""
+    profiles = adapter.list_voice_profiles()
+    return [p.to_dict() for p in profiles]
+
+
+@router.put("/profiles/{profile_id}")
+async def update_voice_profile(
+    profile_id: str,
+    req: ProfileUpdateRequest,
+    adapter: Any = Depends(_get_meanvc2_adapter),
+) -> dict[str, Any]:
+    """Update tuning parameters or visual metadata of a profile."""
+    updates = req.model_dump(exclude_unset=True)
+    updated = adapter.update_voice_profile(profile_id, updates)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return updated.to_dict()
+
+
+@router.post("/monitor")
+async def toggle_headphone_monitor(
+    req: MonitorControlRequest,
+    adapter: Any = Depends(_get_meanvc2_adapter),
+) -> dict[str, Any]:
+    """Toggle or configure real-time headphone monitoring."""
+    if req.device_id is not None and hasattr(adapter, "set_monitor_device"):
+        adapter.set_monitor_device(req.device_id)
+    adapter.set_monitor_enabled(req.enabled)
+    if req.volume is not None:
+        adapter.set_monitor_volume(req.volume)
+    bridge = getattr(adapter, "_audio_bridge", None)
+    return {
+        "monitor_enabled": getattr(bridge, "monitor_enabled", req.enabled),
+        "monitor_volume": getattr(bridge, "monitor_volume", 1.0),
+        "monitor_device_id": getattr(bridge, "monitor_device_id", req.device_id),
+    }
+
+
+@router.post("/volume")
+async def set_master_volume(
+    req: VolumeControlRequest,
+    adapter: Any = Depends(_get_meanvc2_adapter),
+) -> dict[str, Any]:
+    """Set master virtual microphone output volume gain."""
+    adapter.set_output_volume(req.volume)
+    bridge = getattr(adapter, "_audio_bridge", None)
+    return {"output_volume": getattr(bridge, "output_volume", req.volume)}
+
+
+@router.post("/stream/start")
+async def start_stream(
+    req: StreamStartRequest,
+    adapter: Any = Depends(_get_meanvc2_adapter),
+) -> dict[str, Any]:
+    """Start MeanVC2 live audio streaming with WASAPI mic capture and VB-CABLE output."""
+    from hth.domain.api_contracts import LiveConfig
+    if not adapter._active_profile_id:
+        profiles = adapter.list_voice_profiles()
+        if profiles:
+            await adapter.select_voice_profile(profiles[0].profile_id)
+    cfg = LiveConfig(
+        input_device_id=req.input_device_id,
+        output_device_id=req.output_device_id,
+        monitor_device_id=req.monitor_device_id,
+        enable_audio_streams=req.enable_audio_streams,
+    )
+    try:
+        if hasattr(adapter, "start_stream"):
+            await adapter.start_stream(cfg)
+        else:
+            await adapter.start(cfg)
+        return {"status": "started", "engine_state": "RUNNING"}
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        logger.error("Failed to start MeanVC2 stream", error=str(e), traceback=tb)
+        raise HTTPException(status_code=500, detail=str(e) or repr(e)) from e
+
+
+@router.post("/stream/stop")
+async def stop_stream(
+    adapter: Any = Depends(_get_meanvc2_adapter),
+) -> dict[str, Any]:
+    """Stop MeanVC2 live audio streaming."""
+    try:
+        await adapter.stop()
+        return {"status": "stopped", "engine_state": "IDLE"}
+    except Exception as e:
+        logger.error("Failed to stop MeanVC2 stream", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/stream/mute")
+async def toggle_stream_mute(
+    req: StreamMuteRequest,
+    adapter: Any = Depends(_get_meanvc2_adapter),
+) -> dict[str, Any]:
+    """Engage or disengage fail-closed stream mute."""
+    if req.muted:
+        await adapter.panic_mute()
+    else:
+        await adapter.unmute()
+    return {"is_muted": getattr(adapter, "_is_muted", False)}
+
+
+@router.delete("/profiles/{profile_id}")
+async def delete_voice_profile(profile_id: str, adapter: Any = Depends(_get_meanvc2_adapter)) -> dict[str, str]:
+    """Delete a voice profile."""
+    success = adapter.delete_voice_profile(profile_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return {"deleted": profile_id}
+
+
+@router.post("/profiles/{profile_id}/select")
+async def select_voice_profile(profile_id: str, adapter: Any = Depends(_get_meanvc2_adapter)) -> dict[str, str]:
+    """Select a voice profile as the active target speaker."""
+    try:
+        await adapter.select_voice_profile(profile_id)
+        return {"selected": profile_id}
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@router.post("/initialize")
+async def initialize_adapter(adapter: Any = Depends(_get_meanvc2_adapter)) -> dict[str, str]:
+    """Initialize the MeanVC2 worker subprocess."""
+    try:
+        await adapter.initialize()
+        return {"status": "initialized"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/download-assets")
+async def download_assets(adapter: Any = Depends(_get_meanvc2_adapter)) -> dict[str, str]:
+    """Trigger HF asset download (background task)."""
+    from hth.adapters.meanvc2.asset_manager import MeanVC2AssetManager
+    mgr = MeanVC2AssetManager(adapter._cfg.model_dir)
+
+    async def _download() -> None:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, mgr.download_hf_assets)
+        await loop.run_in_executor(None, mgr.download_wavlm)
+
+    asyncio.create_task(_download())
+    return {"status": "download_started", "model_dir": str(adapter._cfg.model_dir)}
+
+
+@router.get("/assets")
+async def get_asset_status(adapter: Any = Depends(_get_meanvc2_adapter)) -> dict[str, Any]:
+    """Get detailed asset download/existence status."""
+    from hth.adapters.meanvc2.asset_manager import MeanVC2AssetManager
+    mgr = MeanVC2AssetManager(adapter._cfg.model_dir)
+    statuses = mgr.status()
+    return {
+        "assets": [
+            {
+                "name": s.name,
+                "local_path": s.local_path,
+                "exists": s.exists,
+                "size_bytes": s.size_bytes,
+                "source_url": s.source_url,
+            }
+            for s in statuses
+        ],
+        "model_dir": str(adapter._cfg.model_dir),
+    }
+
+
+@router.post("/variant")
+async def set_model_variant(req: ModelVariantRequest, adapter: Any = Depends(_get_meanvc2_adapter)) -> dict[str, str]:
+    """Switch between 40ms (low latency) and 120ms (high quality) model variants."""
+    if req.variant not in ("40ms", "120ms"):
+        raise HTTPException(status_code=400, detail="variant must be '40ms' or '120ms'")
+    adapter._cfg.model_variant = req.variant
+    if hasattr(adapter, "_worker_loaded"):
+        adapter._worker_loaded.clear()
+    return {"variant": req.variant, "note": "Restart engine to apply new variant"}

@@ -14,8 +14,24 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
-from ctypes import HRESULT, POINTER, Structure, c_ulong, c_wchar_p, wintypes
+from ctypes import POINTER, Structure, c_ulong, c_wchar_p
 from typing import Protocol
+
+# Windows-only ctypes types — stubbed on Linux/macOS (Colab cloud mode)
+if sys.platform == "win32":
+    from ctypes import HRESULT, wintypes  # type: ignore[assignment]
+else:
+    # Minimal stubs so module-level class definitions don't crash on import
+    HRESULT = ctypes.c_long  # type: ignore[misc,assignment]
+
+    class _WintypesStub:  # type: ignore[no-redef]
+        WORD = ctypes.c_uint16
+        BYTE = ctypes.c_uint8
+        DWORD = ctypes.c_uint32
+        UINT = ctypes.c_uint32
+        ULONG = ctypes.c_uint32
+
+    wintypes = _WintypesStub()  # type: ignore[assignment]
 
 from hth.core.logging import get_logger
 from hth.domain.api_contracts import DeviceInfo, DeviceType

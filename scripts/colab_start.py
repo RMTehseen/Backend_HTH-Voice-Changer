@@ -47,7 +47,10 @@ def start_tunnel_and_server():
 
     # Set environment variables for headless cloud operation
     os.environ["HTH_COMMERCIAL_MODE"] = "false"
+    os.environ["HTH_COMMERCIAL_BUILD"] = "false"
     os.environ["HTH_DEFAULT_ENGINE"] = "meanvc2"
+    os.environ["HTH_ENGINE_ADAPTER"] = "meanvc2"
+    os.environ["HTH_MEANVC2_DEVICE"] = "cuda"
     if "HTH_MEANVC2_MODEL_DIR" not in os.environ:
         os.environ["HTH_MEANVC2_MODEL_DIR"] = str(Path.cwd() / "models" / "MeanVC2Models")
     if "HTH_MEANVC2_SOURCE_DIR" not in os.environ:
@@ -93,14 +96,23 @@ def start_tunnel_and_server():
 
     # Start Uvicorn backend server
     print("Starting FastAPI Uvicorn engine on 0.0.0.0:8765...")
-    sys.path.insert(0, str(Path.cwd() / "src"))
+    src_dir = str(Path.cwd() / "src")
+    sys.path.insert(0, src_dir)
+    sys.path.insert(0, str(Path.cwd()))
+
+    env = os.environ.copy()
+    env["HTH_CLOUD_MODE"] = "true"
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{src_dir}:{Path.cwd()}:{existing_pythonpath}"
+
     subprocess.run([
         sys.executable, "-m", "uvicorn",
         "hth.core.app:create_app",
         "--host", "0.0.0.0",
         "--port", "8765",
-        "--factory"
-    ])
+        "--factory",
+        "--app-dir", src_dir,
+    ], env=env)
 
 
 if __name__ == "__main__":

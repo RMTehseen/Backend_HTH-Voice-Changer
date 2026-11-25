@@ -1,17 +1,16 @@
 """Unit tests for MeanVC2 adapter, config, voice profiles, and fail-closed safety."""
 
-import os
 import tempfile
+
 import numpy as np
 import pytest
 
+from hth.adapters.meanvc2.adapter import MeanVC2VoiceAdapter
 from hth.adapters.meanvc2.config import MeanVC2Config
 from hth.adapters.meanvc2.voice_profile import (
     VoiceProfile,
     VoiceProfileStore,
-    validate_reference_audio,
 )
-from hth.adapters.meanvc2.adapter import MeanVC2VoiceAdapter
 from hth.domain.api_contracts import EngineState, LiveConfig
 
 

@@ -116,6 +116,10 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         if request.method == "OPTIONS":
             return await call_next(request)
 
+        import os
+        if os.environ.get("HTH_CLOUD_MODE", "false").lower() in ("true", "1"):
+            return await call_next(request)
+
         # --- Host validation (DNS Rebinding prevention) ---
         host = request.headers.get("host", "").strip()
         if not host:

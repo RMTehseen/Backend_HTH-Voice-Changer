@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -58,14 +57,14 @@ class VoiceProfile:
 class VoiceProfileStore:
     r"""JSON-file backed voice profile store under %LOCALAPPDATA%\HTH\MeanVC2Profiles."""
 
-    def __init__(self, profile_dir: str):
+    def __init__(self, profile_dir: str, auto_seed: bool = False):
         self.profile_dir = Path(profile_dir)
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self._index_path = self.profile_dir / "profiles.json"
         self._profiles: dict[str, VoiceProfile] = {}
-        self._load_index()
+        self._load_index(auto_seed=auto_seed)
 
-    def _load_index(self) -> None:
+    def _load_index(self, auto_seed: bool = False) -> None:
         if self._index_path.exists():
             try:
                 with open(self._index_path, encoding="utf-8") as f:
@@ -76,6 +75,178 @@ class VoiceProfileStore:
                 }
             except Exception as e:
                 logger.warning("Failed to load profile index", error=str(e))
+
+        if not self._profiles and auto_seed:
+            self._seed_default_profiles()
+
+    def _seed_default_profiles(self) -> None:
+        """Seed pre-configured curated voice profiles if store is empty (e.g. cloud or new instance)."""
+        defaults = [
+            VoiceProfile(
+                profile_id="profile-female-eva",
+                display_name="Eva",
+                avatar_id="female_eva",
+                category="Female",
+                badge="AI",
+                pitch_shift=2.5,
+                timbre_ratio=1.05,
+                volume_gain=1.25,
+                sound_effect="room",
+                favorite=True,
+                consent_declared=True,
+                consent_statement="Consented internal reference voice for HTH Real Voice Changer.",
+                language_hint="en-US",
+                description="Bright, clear, and natural female voice suitable for conversations and calls.",
+            ),
+            VoiceProfile(
+                profile_id="profile-female-ayesha",
+                display_name="Ayesha",
+                avatar_id="female_ayesha",
+                category="Female",
+                badge="NEW",
+                pitch_shift=0.0,
+                timbre_ratio=1.0,
+                volume_gain=1.0,
+                sound_effect="telephone",
+                favorite=False,
+                consent_declared=True,
+                consent_statement="Consented internal reference voice for HTH Real Voice Changer.",
+                language_hint="ur-PK / en",
+                description="Warm, natural soft female voice with smooth articulation.",
+            ),
+            VoiceProfile(
+                profile_id="profile-female-zara",
+                display_name="Zara",
+                avatar_id="female_zara",
+                category="Female",
+                badge="PRO",
+                pitch_shift=1.0,
+                timbre_ratio=1.05,
+                volume_gain=1.0,
+                sound_effect="room",
+                favorite=True,
+                consent_declared=True,
+                consent_statement="Consented internal reference voice for HTH Real Voice Changer.",
+                language_hint="en-US",
+                description="Warm, expressive female voice with rich dynamic timbre.",
+            ),
+            VoiceProfile(
+                profile_id="profile-male-bilal",
+                display_name="Bilal",
+                avatar_id="male_bilal",
+                category="Male",
+                badge="AI",
+                pitch_shift=-1.0,
+                timbre_ratio=0.95,
+                volume_gain=1.0,
+                sound_effect="none",
+                favorite=False,
+                consent_declared=True,
+                consent_statement="Consented internal reference voice for HTH Real Voice Changer.",
+                language_hint="ur-PK / en",
+                description="Deep, authoritative yet natural male timbre.",
+            ),
+            VoiceProfile(
+                profile_id="profile-female-source",
+                display_name="Daniel (Anime)",
+                avatar_id="female_source",
+                category="Character",
+                badge="NEW",
+                pitch_shift=3.0,
+                timbre_ratio=1.1,
+                volume_gain=1.0,
+                sound_effect="none",
+                favorite=False,
+                consent_declared=True,
+                consent_statement="Consented internal reference voice for HTH Real Voice Changer.",
+                language_hint="ja / en",
+                description="High-spirited anime character style expressive voice.",
+            ),
+            VoiceProfile(
+                profile_id="profile-character-ratke",
+                display_name="Ratke (Cyber)",
+                avatar_id="character_ratke",
+                category="Character",
+                badge="AI",
+                pitch_shift=-2.0,
+                timbre_ratio=0.9,
+                volume_gain=1.0,
+                sound_effect="radio",
+                favorite=False,
+                consent_declared=True,
+                consent_statement="Consented internal reference voice for HTH Real Voice Changer.",
+                language_hint="en",
+                description="Futuristic mechanical modulated synthetic voice.",
+            ),
+            VoiceProfile(
+                profile_id="profile-female-ananya",
+                display_name="Ananya",
+                avatar_id="female_ananya",
+                category="Female",
+                badge="HINDI",
+                pitch_shift=1.5,
+                timbre_ratio=1.05,
+                volume_gain=1.1,
+                sound_effect="none",
+                favorite=True,
+                consent_declared=True,
+                consent_statement="Consented internal natural reference voice for HTH Voice Changer.",
+                language_hint="hi-IN / ur",
+                description="Natural Indian Hindi/Urdu female accent, expressive and polite tone for live calls.",
+            ),
+            VoiceProfile(
+                profile_id="profile-female-priya",
+                display_name="Priya",
+                avatar_id="female_priya",
+                category="Female",
+                badge="DESI",
+                pitch_shift=2.0,
+                timbre_ratio=1.08,
+                volume_gain=1.0,
+                sound_effect="radio",
+                favorite=True,
+                consent_declared=True,
+                consent_statement="Consented internal natural reference voice for HTH Voice Changer.",
+                language_hint="hi-IN / en-IN",
+                description="Crisp Indian accent female voice with clear articulation and natural cadence.",
+            ),
+            VoiceProfile(
+                profile_id="profile-female-sana",
+                display_name="Sana",
+                avatar_id="female_sana",
+                category="Female",
+                badge="URDU",
+                pitch_shift=1.0,
+                timbre_ratio=1.04,
+                volume_gain=1.15,
+                sound_effect="none",
+                favorite=True,
+                consent_declared=True,
+                consent_statement="Consented internal natural reference voice for HTH Voice Changer.",
+                language_hint="ur-PK",
+                description="Soft, pleasant Pakistani Urdu female accent, authentic and friendly tone.",
+            ),
+            VoiceProfile(
+                profile_id="profile-female-chloe",
+                display_name="Chloe",
+                avatar_id="female_chloe",
+                category="Female",
+                badge="MELODIC",
+                pitch_shift=2.5,
+                timbre_ratio=1.1,
+                volume_gain=1.0,
+                sound_effect="none",
+                favorite=True,
+                consent_declared=True,
+                consent_statement="Consented internal natural reference voice for HTH Voice Changer.",
+                language_hint="en-US",
+                description="Melodic, gentle international female voice with bright timbre.",
+            ),
+        ]
+        for p in defaults:
+            self._profiles[p.profile_id] = p
+        self._save_index()
+        logger.info("Seeded 10 default voice profiles into store", count=len(defaults))
 
     def _save_index(self) -> None:
         tmp = self._index_path.with_suffix(".tmp")
@@ -123,8 +294,8 @@ def compute_file_sha256(path: str) -> str:
 def validate_reference_audio(wav_path: str) -> dict:
     """Validate reference audio file. Returns dict with keys: valid, error, duration_s, sample_rate."""
     try:
-        import soundfile as sf
         import numpy as np
+        import soundfile as sf
         data, sr = sf.read(wav_path)
         if data.ndim == 2:
             data = np.mean(data, axis=1)

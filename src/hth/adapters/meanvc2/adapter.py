@@ -17,9 +17,7 @@ import base64
 import collections
 import json
 import os
-import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any, Deque, Optional
 
@@ -34,8 +32,14 @@ from hth.domain.api_contracts import (
     LiveConfig,
     LiveStatus,
 )
+
 from .config import MeanVC2Config
-from .voice_profile import VoiceProfile, VoiceProfileStore, validate_reference_audio, compute_file_sha256
+from .voice_profile import (
+    VoiceProfile,
+    VoiceProfileStore,
+    compute_file_sha256,
+    validate_reference_audio,
+)
 
 logger = get_logger("hth.adapters.meanvc2")
 
@@ -83,7 +87,7 @@ class MeanVC2VoiceAdapter:
         # Profile store
         local_app_data = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
         profile_dir = str(Path(local_app_data) / "HTH" / "MeanVC2Profiles")
-        self._profile_store = VoiceProfileStore(profile_dir)
+        self._profile_store = VoiceProfileStore(profile_dir, auto_seed=True)
 
         # WASAPI physical audio bridge
         from .audio_bridge import MeanVC2AudioBridge
@@ -386,7 +390,6 @@ class MeanVC2VoiceAdapter:
 
     async def _processing_loop(self) -> None:
         """Main audio processing loop — feeds input chunks to worker."""
-        CHUNK = 2560  # 160ms at 16kHz — same as upstream CHUNK
         while self._state == EngineState.RUNNING:
             if self._input_queue:
                 chunk = self._input_queue.popleft()

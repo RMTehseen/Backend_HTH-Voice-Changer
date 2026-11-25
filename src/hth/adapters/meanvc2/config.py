@@ -1,8 +1,10 @@
 """MeanVC2 adapter configuration."""
 from __future__ import annotations
+
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
 
 # Default model directory: %LOCALAPPDATA%\HTH\MeanVC2Models
 def _default_model_dir() -> str:

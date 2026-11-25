@@ -36,18 +36,18 @@ except ImportError:
     sd = None
     HAS_SOUNDDEVICE = False
 
+from hth.adapters.meanvc2.dsp_effects import DSPPostProcessor
 from hth.audio.resampler import (
     FRAME_SIZE_16K,
     FRAME_SIZE_48K,
     FS_16K,
     FS_48K,
-    PolyphaseResampler48To16,
     PolyphaseResampler16To48,
+    PolyphaseResampler48To16,
 )
 from hth.audio.ring_buffer import AudioRingBuffer
 from hth.core.logging import get_logger
-from hth.domain.errors import AudioProcessingError, DeviceError
-from hth.adapters.meanvc2.dsp_effects import DSPPostProcessor
+from hth.domain.errors import DeviceError
 
 logger = get_logger("hth.adapters.meanvc2.audio_bridge")
 
@@ -211,11 +211,25 @@ class MeanVC2AudioBridge:
             elif isinstance(dev_id, str) and dev_id.isdigit() and 0 <= int(dev_id) < len(devices):
                 cand_idx = int(dev_id)
             elif isinstance(dev_id, str):
-                search_term = dev_id.lower()
+                search_terms = [dev_id.lower()]
+                if "{" in dev_id:
+                    try:
+                        from hth.audio.devices import get_device_inventory
+                        inv = get_device_inventory()
+                        for ep in inv.capture_devices:
+                            if ep.id.lower() == dev_id.lower():
+                                search_terms.append(ep.friendly_name.lower())
+                                base_name = ep.friendly_name.split("(")[0].strip().lower()
+                                if base_name:
+                                    search_terms.append(base_name)
+                                break
+                    except Exception:
+                        pass
+
                 for idx, d in enumerate(devices):
                     if d.get("max_input_channels", 0) > 0 and d.get("hostapi") == wasapi_idx:
                         name = d.get("name", "").lower()
-                        if search_term in name:
+                        if any(term in name for term in search_terms):
                             cand_idx = idx
                             break
             if cand_idx is not None:
@@ -267,11 +281,25 @@ class MeanVC2AudioBridge:
                 return dev_id
             if isinstance(dev_id, str) and dev_id.isdigit():
                 return int(dev_id)
-            search_term = str(dev_id).lower()
+            search_terms = [str(dev_id).lower()]
+            if isinstance(dev_id, str) and "{" in dev_id:
+                try:
+                    from hth.audio.devices import get_device_inventory
+                    inv = get_device_inventory()
+                    for ep in inv.render_devices:
+                        if ep.id.lower() == dev_id.lower():
+                            search_terms.append(ep.friendly_name.lower())
+                            base_name = ep.friendly_name.split("(")[0].strip().lower()
+                            if base_name:
+                                search_terms.append(base_name)
+                            break
+                except Exception:
+                    pass
+
             for idx, d in enumerate(devices):
                 if d.get("max_output_channels", 0) > 0 and d.get("hostapi") == wasapi_idx:
                     name = d.get("name", "").lower()
-                    if search_term in name:
+                    if any(term in name for term in search_terms):
                         return idx
 
         if live_call_mode:
@@ -306,11 +334,24 @@ class MeanVC2AudioBridge:
                 if 0 <= idx_val < len(devices) and not _is_cable(devices[idx_val].get("name", "")):
                     return idx_val
             elif isinstance(dev_target, str):
-                search_term = dev_target.lower()
+                search_terms = [dev_target.lower()]
+                if "{" in dev_target:
+                    try:
+                        from hth.audio.devices import get_device_inventory
+                        inv = get_device_inventory()
+                        for ep in inv.render_devices:
+                            if ep.id.lower() == dev_target.lower():
+                                search_terms.append(ep.friendly_name.lower())
+                                base_name = ep.friendly_name.split("(")[0].strip().lower()
+                                if base_name:
+                                    search_terms.append(base_name)
+                                break
+                    except Exception:
+                        pass
                 for idx, d in enumerate(devices):
                     if d.get("max_output_channels", 0) > 0 and d.get("hostapi") == wasapi_idx:
                         name = d.get("name", "").lower()
-                        if not _is_cable(name) and search_term in name:
+                        if not _is_cable(name) and any(term in name for term in search_terms):
                             return idx
 
         # Auto-detection preference 1: Jabra or Headphone

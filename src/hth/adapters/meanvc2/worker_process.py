@@ -33,8 +33,8 @@ import base64
 import json
 import os
 import sys
-import time
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -76,10 +76,10 @@ class MeanVC2Worker:
         source_dir = config["source_dir"]
         _add_meanvc2_to_path(source_dir)
 
-        from src.dit import DiT
-        from src.speaker import init_speaker_model, extract_embedding
-
         import json as _json
+
+        from src.dit import DiT
+        from src.speaker import extract_embedding, init_speaker_model
 
         variant = config.get("model_variant", "40ms")
         requested_device = config.get("device", "cpu")

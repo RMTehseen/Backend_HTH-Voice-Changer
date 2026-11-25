@@ -140,9 +140,10 @@ def init_engine_service(adapter: str = "dsp") -> None:
                 "Beatrice engine adapter is quarantined and excluded from this distribution."
             )
     elif adapter == "meanvc2":
+        import os
+
         from hth.adapters.meanvc2.adapter import MeanVC2VoiceAdapter
         from hth.adapters.meanvc2.config import MeanVC2Config
-        import os
         cfg = MeanVC2Config(
             device=os.environ.get("HTH_MEANVC2_DEVICE", "cpu"),
             model_variant=os.environ.get("HTH_MEANVC2_VARIANT", "40ms"),

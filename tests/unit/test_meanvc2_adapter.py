@@ -247,5 +247,34 @@ async def test_clean_mic_bypass_selection():
     assert adapter.get_active_profile() is None
 
 
+def test_meanvc2_config_empty_source_dir_and_env(monkeypatch):
+    """Empty source_dir must report False (not CWD), and HTH_MEANVC2_SOURCE_DIR overrides."""
+    cfg_empty = MeanVC2Config(source_dir="")
+    assets = cfg_empty.check_assets()
+    assert assets["source_dir"] is False
+    assert assets["vc_config"] is False
+
+    monkeypatch.setenv("HTH_MEANVC2_SOURCE_DIR", "/tmp/custom_meanvc2_src")
+    cfg_env = MeanVC2Config()
+    assert cfg_env.source_dir == "/tmp/custom_meanvc2_src"
+
+
+@pytest.mark.asyncio
+async def test_remote_audio_subscription_and_bypass():
+    """Remote WebSocket subscriber receives converted/bypass bytes and unsubscribes cleanly."""
+    adapter = MeanVC2VoiceAdapter()
+    q = adapter.subscribe_audio_out()
+    adapter._state = EngineState.RUNNING
+    await adapter.select_voice_profile("clean-mic")
+
+    samples = np.ones(160, dtype=np.float32) * 0.25
+    await adapter.push_remote_audio(samples)
+
+    out_bytes = q.get_nowait()
+    assert len(out_bytes) == 160 * 4
+    adapter.unsubscribe_audio_out(q)
+    assert q not in adapter._remote_audio_queues
+
+
 
 

@@ -5,9 +5,9 @@ Zero cost, zero registration, zero credit card required.
 """
 import os
 import re
+import subprocess
 import sys
 import time
-import subprocess
 import urllib.request
 from pathlib import Path
 
@@ -42,6 +42,43 @@ def setup_cloudflared() -> Path:
     return bin_path
 
 
+def ensure_meanvc2_runtime():
+    """Ensure MeanVC2 runtime deps and model weights are installed on Colab."""
+    import importlib.util
+
+    required_pkgs = {
+        "einops": "einops>=0.8.0",
+        "x_transformers": "x-transformers>=2.0.0",
+        "s3prl": "s3prl>=0.4",
+        "safetensors": "safetensors>=0.4.0",
+        "soundfile": "soundfile>=0.12.1",
+        "huggingface_hub": "huggingface-hub>=0.20.0",
+    }
+    missing = [pkg for mod, pkg in required_pkgs.items() if importlib.util.find_spec(mod) is None]
+    if missing:
+        print(f"📦 Installing missing MeanVC2 runtime dependencies: {', '.join(missing)}...")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", *missing],
+            check=True,
+        )
+
+    model_dir = Path(os.environ.get("HTH_MEANVC2_MODEL_DIR", str(Path.cwd() / "models" / "MeanVC2Models")))
+    source_dir = Path(os.environ.get("HTH_MEANVC2_SOURCE_DIR", str(Path.cwd() / "MeanVC2-main")))
+    required_files = [
+        source_dir / "src" / "config" / "config_40ms_40ms.json",
+        model_dir / "ckpts" / "pretrained_models" / "meanvc2_40ms_40ms.safetensors",
+        model_dir / "preprocess" / "ckpts" / "fastu2pp_80ms.pt",
+        model_dir / "ckpts" / "vocos" / "vocos.pt",
+        model_dir / "preprocess" / "ckpts" / "wavlm_large_finetune.pth",
+        model_dir / "preprocess" / "ckpts" / "wavlm_large_cfg.pt",
+    ]
+    if not all(p.is_file() for p in required_files):
+        print("⬇️ Downloading MeanVC2 source & neural weights (first run only)...")
+        dl_script = Path(__file__).resolve().parent / "download_models.py"
+        if dl_script.is_file():
+            subprocess.run([sys.executable, str(dl_script)], check=True)
+
+
 def start_tunnel_and_server():
     check_gpu()
 
@@ -55,6 +92,8 @@ def start_tunnel_and_server():
         os.environ["HTH_MEANVC2_MODEL_DIR"] = str(Path.cwd() / "models" / "MeanVC2Models")
     if "HTH_MEANVC2_SOURCE_DIR" not in os.environ:
         os.environ["HTH_MEANVC2_SOURCE_DIR"] = str(Path.cwd() / "MeanVC2-main")
+
+    ensure_meanvc2_runtime()
 
     # Start Cloudflare Tunnel
     cloudflared = setup_cloudflared()

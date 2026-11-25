@@ -2,15 +2,29 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import os
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+import numpy as np
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from pydantic import BaseModel
 
 from hth.api.dependencies import get_engine_service
 from hth.core.logging import get_logger
+from hth.core.security import ticket_store
+from hth.core.settings import get_settings
+from hth.domain.api_contracts import EngineState
 from hth.services.engine_service import EngineService
 
 logger = get_logger("hth.api.meanvc2")
@@ -270,6 +284,13 @@ async def start_stream(
         profiles = adapter.list_voice_profiles()
         if profiles:
             await adapter.select_voice_profile(profiles[0].profile_id)
+    if not adapter._cfg.all_assets_ready():
+        missing = [k for k, v in adapter._cfg.check_assets().items() if not v]
+        raise HTTPException(
+            status_code=400,
+            detail=f"MeanVC2 assets missing: {', '.join(missing)}. Download weights first.",
+        )
+
     cfg = LiveConfig(
         input_device_id=req.input_device_id,
         output_device_id=req.output_device_id,
@@ -282,6 +303,9 @@ async def start_stream(
         else:
             await adapter.start(cfg)
         return {"status": "started", "engine_state": "RUNNING"}
+    except RuntimeError as e:
+        logger.warning("MeanVC2 stream start rejected", error=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
@@ -345,18 +369,29 @@ async def initialize_adapter(adapter: Any = Depends(_get_meanvc2_adapter)) -> di
 
 
 @router.post("/download-assets")
-async def download_assets(adapter: Any = Depends(_get_meanvc2_adapter)) -> dict[str, str]:
-    """Trigger HF asset download (background task)."""
+async def download_assets(adapter: Any = Depends(_get_meanvc2_adapter)) -> dict[str, Any]:
+    """Trigger HF asset download and upstream MeanVC2 code clone (background task)."""
     from hth.adapters.meanvc2.asset_manager import MeanVC2AssetManager
+
     mgr = MeanVC2AssetManager(adapter._cfg.model_dir)
+    target_source_dir = adapter._cfg.source_dir or str(Path.cwd() / "MeanVC2-main")
+    adapter._cfg.source_dir = target_source_dir
+    variant = getattr(adapter._cfg, "model_variant", "40ms")
 
     async def _download() -> None:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, mgr.download_hf_assets)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, mgr.ensure_source_code, target_source_dir)
+        await loop.run_in_executor(None, mgr.download_hf_assets, variant)
         await loop.run_in_executor(None, mgr.download_wavlm)
 
     asyncio.create_task(_download())
-    return {"status": "download_started", "model_dir": str(adapter._cfg.model_dir)}
+    return {
+        "ok": True,
+        "status": "download_started",
+        "message": "Model weights and MeanVC2 source download started in background.",
+        "model_dir": str(adapter._cfg.model_dir),
+        "source_dir": target_source_dir,
+    }
 
 
 @router.get("/assets")
@@ -389,3 +424,72 @@ async def set_model_variant(req: ModelVariantRequest, adapter: Any = Depends(_ge
     if hasattr(adapter, "_worker_loaded"):
         adapter._worker_loaded.clear()
     return {"variant": req.variant, "note": "Restart engine to apply new variant"}
+
+
+_MAX_AUDIO_WS_FRAME_BYTES = 262144  # 256 KB guard per binary PCM chunk
+
+
+@router.websocket("/ws/audio")
+async def websocket_audio_stream(
+    websocket: WebSocket,
+    ticket: str = "",
+) -> None:
+    """Real-time bidirectional 16kHz float32 PCM WebSocket for remote/Colab GPU audio conversion.
+
+    Authenticated via single-use ?ticket= (from POST /api/v1/auth/ws-ticket) or hth_session cookie.
+    Fail-closed: on engine error or mute, stops emitting converted audio cleanly.
+    """
+    settings = get_settings()
+
+    if ticket:
+        if not ticket_store.redeem_ws_ticket(ticket):
+            await websocket.close(code=1008)
+            return
+    else:
+        cookie_token = websocket.cookies.get("hth_session", "")
+        if not cookie_token or not hmac.compare_digest(
+            cookie_token.encode("utf-8"), settings.session_token.encode("utf-8")
+        ):
+            await websocket.close(code=1008)
+            return
+
+    engine_svc = get_engine_service()
+    adapter = getattr(engine_svc, "_engine", None)
+    if hasattr(adapter, "_inner"):
+        adapter = adapter._inner
+    if not hasattr(adapter, "subscribe_audio_out") or not hasattr(adapter, "push_remote_audio"):
+        await websocket.close(code=1011)
+        return
+
+    await websocket.accept()
+    out_queue = adapter.subscribe_audio_out()
+
+    async def _send_loop() -> None:
+        try:
+            while True:
+                pcm_bytes = await out_queue.get()
+                if adapter._state == EngineState.ERROR:
+                    break
+                await websocket.send_bytes(pcm_bytes)
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            pass
+        except Exception:
+            pass
+
+    sender_task = asyncio.create_task(_send_loop())
+    try:
+        while True:
+            data = await websocket.receive_bytes()
+            if not data or len(data) > _MAX_AUDIO_WS_FRAME_BYTES or (len(data) % 4) != 0:
+                continue
+            if adapter._state == EngineState.ERROR:
+                break
+            samples = np.frombuffer(data, dtype=np.float32).copy()
+            await adapter.push_remote_audio(samples)
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        pass
+    except Exception as e:
+        logger.warning("Remote audio WebSocket error", error=str(e))
+    finally:
+        sender_task.cancel()
+        adapter.unsubscribe_audio_out(out_queue)

@@ -12,12 +12,18 @@ def _default_model_dir() -> str:
     return str(Path(local_app_data) / "HTH" / "MeanVC2Models")
 
 def _default_source_dir() -> str:
-    # MeanVC2 source is extracted to <project_root>/MeanVC2-main
+    env_val = os.environ.get("HTH_MEANVC2_SOURCE_DIR", "").strip()
+    if env_val:
+        return env_val
+    # MeanVC2 source is extracted to <project_root>/MeanVC2-main (or CWD/MeanVC2-main)
+    cwd_candidate = Path.cwd() / "MeanVC2-main"
+    if cwd_candidate.is_dir():
+        return str(cwd_candidate)
     here = Path(__file__).resolve()
     # Walk up to find project root (has MeanVC2-main folder)
     for parent in here.parents:
         candidate = parent / "MeanVC2-main"
-        if candidate.exists():
+        if candidate.is_dir():
             return str(candidate)
     return ""
 
@@ -71,14 +77,15 @@ class MeanVC2Config:
 
     def check_assets(self) -> dict[str, bool]:
         """Return dict of asset_name -> exists."""
+        has_source = bool(self.source_dir) and Path(self.source_dir).is_dir()
         return {
-            "vc_model": Path(self.vc_model_path).exists(),
-            "vc_config": Path(self.vc_config_path).exists(),
-            "asr_model": Path(self.asr_model_path).exists(),
-            "vocoder": Path(self.vocoder_path).exists(),
-            "speaker_model": Path(self.speaker_model_path).exists(),
-            "wavlm_config": Path(self.wavlm_config_path).exists(),
-            "source_dir": Path(self.source_dir).exists(),
+            "vc_model": Path(self.vc_model_path).is_file(),
+            "vc_config": has_source and Path(self.vc_config_path).is_file(),
+            "asr_model": Path(self.asr_model_path).is_file(),
+            "vocoder": Path(self.vocoder_path).is_file(),
+            "speaker_model": Path(self.speaker_model_path).is_file(),
+            "wavlm_config": Path(self.wavlm_config_path).is_file(),
+            "source_dir": has_source,
         }
 
     def all_assets_ready(self) -> bool:

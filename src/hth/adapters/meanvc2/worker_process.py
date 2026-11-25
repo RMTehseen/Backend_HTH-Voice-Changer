@@ -232,17 +232,30 @@ class MeanVC2Worker:
         if not r:
             raise RuntimeError("Worker not loaded")
 
-        if embedding_path and Path(embedding_path).exists():
+        if embedding_path and Path(embedding_path).is_file():
             # Load cached embedding
             emb = torch.load(embedding_path, map_location="cpu", weights_only=True)
             r.vc_spk_emb = emb.to(r.device)
-        else:
+        elif wav_path and Path(wav_path).is_file():
             # Compute from wav
             from src.speaker import extract_embedding
             r.vc_spk_emb = extract_embedding(r.spk_model, wav_path, device=r.device)
             if embedding_path:
                 Path(embedding_path).parent.mkdir(parents=True, exist_ok=True)
                 torch.save(r.vc_spk_emb.cpu(), embedding_path)
+        else:
+            # Seeded cloud profile without local reference WAV — synthesize deterministic 256-dim embedding
+            import hashlib
+            seed_bytes = hashlib.sha256(profile_id.encode("utf-8")).digest()
+            seed_int = int.from_bytes(seed_bytes[:4], "little")
+            gen = torch.Generator(device="cpu").manual_seed(seed_int)
+            vec = torch.randn(1, 256, generator=gen, dtype=torch.float32)
+            vec = vec / (vec.norm(dim=-1, keepdim=True) + 1e-8) * 12.0
+            r.vc_spk_emb = vec.to(r.device)
+            _emit({
+                "event": "warning",
+                "message": f"Reference audio not present on server for {profile_id}; using deterministic fallback embedding. Upload a reference WAV for custom timbre.",
+            })
 
         with torch.no_grad():
             r.vc_gtm_kv = r.vc.gtm(r.vc_spk_emb)

@@ -190,6 +190,29 @@ class MeanVC2AssetManager:
 
         return results
 
+    def ensure_source_code(self, source_dir: str) -> bool:
+        """Clone ASLP-lab/MeanVC2 upstream runtime code if not already present."""
+        import subprocess
+
+        target = Path(source_dir)
+        if (target / "src" / "config" / "config_40ms_40ms.json").is_file():
+            logger.info("MeanVC2 source already present", source_dir=str(target))
+            return True
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            logger.info("Cloning ASLP-lab/MeanVC2 source code", dest=str(target))
+            subprocess.run(
+                ["git", "clone", "--depth", "1", "https://github.com/ASLP-lab/MeanVC2.git", str(target)],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            return (target / "src" / "config" / "config_40ms_40ms.json").is_file()
+        except Exception as e:
+            logger.error("Failed to clone MeanVC2 source code", error=str(e))
+            return False
+
     def verify_assets(self) -> dict[str, bool]:
         """Verify all required inference assets exist."""
         required = [rel for _, rel in HF_ASSETS]

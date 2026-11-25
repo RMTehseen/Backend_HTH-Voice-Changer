@@ -65,6 +65,7 @@ class MeanVC2VoiceAdapter:
         # Worker subprocess
         self._worker_proc: Optional[asyncio.subprocess.Process] = None
         self._reader_task: Optional[asyncio.Task] = None
+        self._stderr_task: Optional[asyncio.Task] = None
         self._pending: dict[str, asyncio.Future] = {}
         self._worker_ready = asyncio.Event()
         self._worker_loaded = asyncio.Event()
@@ -74,6 +75,9 @@ class MeanVC2VoiceAdapter:
         self._input_queue: Deque[np.ndarray] = collections.deque(maxlen=self._cfg.max_input_queue)
         self._output_queue: Deque[np.ndarray] = collections.deque(maxlen=self._cfg.max_output_queue)
         self._processing_task: Optional[asyncio.Task] = None
+        self._remote_audio_queues: set[asyncio.Queue[bytes]] = set()
+        from .dsp_effects import DSPPostProcessor
+        self._remote_dsp = DSPPostProcessor()
 
         # Metrics
         self._frames_processed: int = 0
@@ -121,14 +125,16 @@ class MeanVC2VoiceAdapter:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=4 * 1024 * 1024,
         )
 
         self._worker_ready.clear()
         self._worker_loaded.clear()
         self._worker_target_set.clear()
 
-        # Start reader
+        # Start stdout & stderr readers
         self._reader_task = asyncio.create_task(self._read_worker_output())
+        self._stderr_task = asyncio.create_task(self._read_worker_stderr())
 
         # Wait for ready signal
         try:
@@ -158,6 +164,19 @@ class MeanVC2VoiceAdapter:
         logger.warning("MeanVC2 dedicated venv not found, using current Python", python=sys.executable)
         return sys.executable
 
+    async def _read_worker_stderr(self) -> None:
+        """Background task: drain worker stderr so pipe never fills and errors surface."""
+        proc = self._worker_proc
+        if not proc or not proc.stderr:
+            return
+        try:
+            async for line in proc.stderr:
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    logger.warning("Worker stderr", text=text[:300])
+        except Exception:
+            pass
+
     async def _read_worker_output(self) -> None:
         """Background task: read JSON events from worker stdout."""
         proc = self._worker_proc
@@ -179,6 +198,39 @@ class MeanVC2VoiceAdapter:
             self._state = EngineState.ERROR
             self._last_error = str(e)
 
+    def subscribe_audio_out(self) -> asyncio.Queue[bytes]:
+        """Register an async queue to receive converted 16kHz float32 PCM chunks."""
+        q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=16)
+        self._remote_audio_queues.add(q)
+        return q
+
+    def unsubscribe_audio_out(self, q: asyncio.Queue[bytes]) -> None:
+        """Remove a WebSocket audio subscriber queue."""
+        self._remote_audio_queues.discard(q)
+
+    def _emit_remote_bytes(self, pcm_bytes: bytes) -> None:
+        for q in list(self._remote_audio_queues):
+            if q.full():
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                q.put_nowait(pcm_bytes)
+            except asyncio.QueueFull:
+                pass
+
+    async def push_remote_audio(self, samples: np.ndarray) -> None:
+        """Push a 16kHz float32 mono chunk from a remote WebSocket client directly to the worker."""
+        if self._state != EngineState.RUNNING or self._is_muted:
+            return
+        if self._active_profile_id in ("clean-mic", "bypass") or self._passthrough_enabled:
+            self._frames_processed += 1
+            self._emit_remote_bytes(samples.astype(np.float32).tobytes())
+            return
+        b64 = base64.b64encode(samples.astype(np.float32).tobytes()).decode()
+        await self._send_to_worker({"cmd": "process_chunk", "data_b64": b64})
+
     async def _handle_worker_event(self, msg: dict) -> None:
         event = msg.get("event", "")
         if event == "ready":
@@ -191,12 +243,25 @@ class MeanVC2VoiceAdapter:
             logger.info("Target speaker set", profile_id=msg.get("profile_id"))
         elif event == "warmup_done":
             logger.info("MeanVC2 warmup complete")
+        elif event == "warning":
+            logger.warning("Worker warning", message=msg.get("message", ""))
         elif event == "audio_out":
             if not self._is_muted and not self._passthrough_enabled:
                 raw = base64.b64decode(msg["data_b64"])
                 samples = np.frombuffer(raw, dtype=np.float32).copy()
                 self._output_queue.append(samples)
                 self._frames_processed += 1
+                if self._remote_audio_queues:
+                    profile = self.get_active_profile()
+                    if profile and self._remote_dsp is not None:
+                        samples = self._remote_dsp.process(
+                            samples,
+                            pitch_shift=float(getattr(profile, "pitch_shift", 0.0) or 0.0),
+                            timbre_ratio=float(getattr(profile, "timbre_ratio", 1.0) or 1.0),
+                            sound_effect=str(getattr(profile, "sound_effect", "none") or "none"),
+                            volume_gain=float(getattr(profile, "volume_gain", 1.0) or 1.0),
+                        )
+                    self._emit_remote_bytes(samples.astype(np.float32).tobytes())
             self._last_inference_ms = msg.get("inference_ms", 0.0)
             self._last_rtf = msg.get("rtf", 0.0)
         elif event == "audio_buffering":
@@ -230,6 +295,8 @@ class MeanVC2VoiceAdapter:
         """Kill the worker subprocess."""
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
+        if self._stderr_task and not self._stderr_task.done():
+            self._stderr_task.cancel()
         if self._worker_proc:
             try:
                 self._worker_proc.kill()
@@ -318,9 +385,10 @@ class MeanVC2VoiceAdapter:
             async with self._lock:
                 self._state = EngineState.RUNNING
 
-            # Start WASAPI physical capture & render streams
+            # Start WASAPI physical capture & render streams (skipped in headless Cloud Mode)
+            is_cloud_mode = os.environ.get("HTH_CLOUD_MODE", "false").lower() in ("true", "1")
             try:
-                if getattr(config, "enable_audio_streams", True):
+                if getattr(config, "enable_audio_streams", True) and not is_cloud_mode:
                     self._audio_bridge.start(
                         input_device_id=config.input_device_id,
                         output_device_id=config.output_device_id,

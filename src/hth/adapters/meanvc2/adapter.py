@@ -18,6 +18,7 @@ import collections
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Deque, Optional
 
@@ -75,7 +76,11 @@ class MeanVC2VoiceAdapter:
         self._input_queue: Deque[np.ndarray] = collections.deque(maxlen=self._cfg.max_input_queue)
         self._output_queue: Deque[np.ndarray] = collections.deque(maxlen=self._cfg.max_output_queue)
         self._processing_task: Optional[asyncio.Task] = None
+        self._watchdog_task: Optional[asyncio.Task] = None
+        self._last_worker_activity: float = 0.0
         self._remote_audio_queues: set[asyncio.Queue[bytes]] = set()
+        self._telemetry_queues: set[asyncio.Queue[dict[str, Any]]] = set()
+        self._last_telemetry_ts: float = 0.0
         self._inflight_chunks: int = 0
         self._max_inflight_chunks: int = 3
         self._last_stderr_tail: Deque[str] = collections.deque(maxlen=10)
@@ -188,6 +193,7 @@ class MeanVC2VoiceAdapter:
             return
         try:
             async for line in proc.stdout:
+                self._last_worker_activity = time.monotonic()
                 line = line.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
@@ -229,6 +235,38 @@ class MeanVC2VoiceAdapter:
     def unsubscribe_audio_out(self, q: asyncio.Queue[bytes]) -> None:
         """Remove a WebSocket audio subscriber queue."""
         self._remote_audio_queues.discard(q)
+
+    def subscribe_telemetry(self) -> asyncio.Queue[dict[str, Any]]:
+        """Register an async queue for throttled live latency/RTF telemetry."""
+        q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=8)
+        self._telemetry_queues.add(q)
+        return q
+
+    def unsubscribe_telemetry(self, q: asyncio.Queue[dict[str, Any]]) -> None:
+        """Remove a WebSocket telemetry subscriber queue."""
+        self._telemetry_queues.discard(q)
+
+    def _emit_telemetry(self) -> None:
+        now = time.monotonic()
+        if not self._telemetry_queues or (now - self._last_telemetry_ts) < 0.8:
+            return
+        self._last_telemetry_ts = now
+        payload = {
+            "type": "telemetry",
+            "inference_ms": self._last_inference_ms,
+            "rtf": self._last_rtf,
+            "overruns": self._overruns,
+        }
+        for q in list(self._telemetry_queues):
+            if q.full():
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                q.put_nowait(payload)
+            except asyncio.QueueFull:
+                pass
 
     def _emit_remote_bytes(self, pcm_bytes: bytes) -> None:
         for q in list(self._remote_audio_queues):
@@ -292,6 +330,7 @@ class MeanVC2VoiceAdapter:
                     self._emit_remote_bytes(samples.astype(np.float32).tobytes())
             self._last_inference_ms = msg.get("inference_ms", 0.0)
             self._last_rtf = msg.get("rtf", 0.0)
+            self._emit_telemetry()
         elif event == "audio_buffering":
             self._inflight_chunks = max(0, self._inflight_chunks - 1)
         elif event == "error":
@@ -322,6 +361,8 @@ class MeanVC2VoiceAdapter:
 
     async def _kill_worker(self) -> None:
         """Kill the worker subprocess."""
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
         if self._stderr_task and not self._stderr_task.done():
@@ -416,8 +457,10 @@ class MeanVC2VoiceAdapter:
             # Reset caches
             await self._send_to_worker({"cmd": "init_cache"})
 
-            # Start processing loop
+            # Start processing loop and heartbeat watchdog
+            self._last_worker_activity = time.monotonic()
             self._processing_task = asyncio.create_task(self._processing_loop())
+            self._watchdog_task = asyncio.create_task(self._watchdog_loop())
 
             async with self._lock:
                 self._state = EngineState.RUNNING
@@ -493,6 +536,36 @@ class MeanVC2VoiceAdapter:
         if self._state == EngineState.ERROR:
             raise RuntimeError(f"Setting target speaker failed: {self._last_error}")
 
+    async def _watchdog_loop(self) -> None:
+        """Verify worker responsiveness; fail-closed mute on heartbeat timeout."""
+        timeout_s = max(5.0, float(self._cfg.heartbeat_timeout_s))
+        try:
+            while self._state == EngineState.RUNNING:
+                await asyncio.sleep(5.0)
+                if self._state != EngineState.RUNNING:
+                    break
+                idle_s = time.monotonic() - self._last_worker_activity
+                if idle_s < timeout_s:
+                    continue
+                sent_at = time.monotonic()
+                ok = await self.ping()
+                if not ok:
+                    self._last_error = "MeanVC2 worker ping failed — muted fail-closed."
+                    self._is_muted = True
+                    self._state = EngineState.ERROR
+                    logger.error("Watchdog ping failed", error=self._last_error)
+                    break
+                await asyncio.sleep(3.0)
+                if self._state == EngineState.RUNNING and self._last_worker_activity < sent_at:
+                    self._last_error = "MeanVC2 worker heartbeat timeout — muted fail-closed."
+                    self._is_muted = True
+                    self._state = EngineState.ERROR
+                    logger.error("Watchdog heartbeat timeout", error=self._last_error)
+                    await self._kill_worker()
+                    break
+        except asyncio.CancelledError:
+            pass
+
     async def _processing_loop(self) -> None:
         """Main audio processing loop — feeds input chunks to worker."""
         while self._state == EngineState.RUNNING:
@@ -555,6 +628,12 @@ class MeanVC2VoiceAdapter:
             self._processing_task.cancel()
             try:
                 await self._processing_task
+            except asyncio.CancelledError:
+                pass
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
             except asyncio.CancelledError:
                 pass
 
@@ -746,6 +825,44 @@ class MeanVC2VoiceAdapter:
         if profile.profile_id == self._active_profile_id and profile.volume_gain is not None:
             self._audio_bridge.output_volume = float(profile.volume_gain)
         self._profile_store.save(profile)
+        return profile
+
+    def profile_has_reference(self, profile: VoiceProfile) -> bool:
+        """Return True if a real WAV or precomputed speaker embedding exists on disk."""
+        emb_path = Path(self._profile_store.get_embedding_path(profile.profile_id))
+        if emb_path.is_file():
+            return True
+        if profile.reference_wav_path and Path(profile.reference_wav_path).is_file():
+            return True
+        return False
+
+    async def attach_profile_reference(self, profile_id: str, reference_wav_path: str) -> VoiceProfile:
+        """Attach or replace the reference WAV for an existing profile and refresh target if active."""
+        profile = self._profile_store.get(profile_id)
+        if not profile:
+            raise KeyError(f"Profile not found: {profile_id}")
+
+        validation = validate_reference_audio(reference_wav_path)
+        if not validation["valid"]:
+            raise ValueError(f"Invalid reference audio: {validation['error']}")
+
+        profile.reference_wav_path = reference_wav_path
+        profile.reference_sha256 = compute_file_sha256(reference_wav_path)
+        profile.reference_duration_s = validation["duration_s"]
+        profile.reference_sample_rate = validation["sample_rate"]
+        profile.embedding_cache_path = ""
+
+        old_emb = Path(self._profile_store.get_embedding_path(profile_id))
+        if old_emb.is_file():
+            try:
+                old_emb.unlink()
+            except OSError:
+                pass
+
+        self._profile_store.save(profile)
+        if self._state == EngineState.RUNNING and self._active_profile_id == profile_id and self._worker_loaded.is_set():
+            self._worker_target_set.clear()
+            await self._apply_profile(profile_id)
         return profile
 
     def set_monitor_enabled(self, enabled: bool) -> None:

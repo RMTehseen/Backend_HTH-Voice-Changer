@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import os
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -115,11 +116,18 @@ def _detect_cpu_name() -> str:
     return proc.strip()
 
 
+def _serialize_profile(adapter: Any, profile: Any) -> dict[str, Any]:
+    data = profile.to_dict()
+    has_ref = adapter.profile_has_reference(profile) if hasattr(adapter, "profile_has_reference") else False
+    data["has_reference_audio"] = has_ref
+    return data
+
+
 @router.get("/status")
 async def get_meanvc2_status(adapter: Any = Depends(_get_meanvc2_adapter)) -> dict[str, Any]:
     """Get MeanVC2 asset/model readiness status."""
     asset_status = adapter.get_asset_status()
-    profiles = [p.to_dict() for p in adapter.list_voice_profiles()]
+    profiles = [_serialize_profile(adapter, p) for p in adapter.list_voice_profiles()]
     worker_proc = getattr(adapter, "_worker_proc", None)
     worker_loaded = getattr(adapter, "_worker_loaded", None)
     target_set = getattr(adapter, "_worker_target_set", None)
@@ -248,7 +256,51 @@ async def upload_voice_profile(
 async def list_voice_profiles(adapter: Any = Depends(_get_meanvc2_adapter)) -> list[dict[str, Any]]:
     """List all saved voice profiles."""
     profiles = adapter.list_voice_profiles()
-    return [p.to_dict() for p in profiles]
+    return [_serialize_profile(adapter, p) for p in profiles]
+
+
+@router.post("/profiles/{profile_id}/reference")
+async def attach_profile_reference_audio(
+    profile_id: str,
+    file: UploadFile = File(...),
+    adapter: Any = Depends(_get_meanvc2_adapter),
+) -> dict[str, Any]:
+    """Attach or replace the reference WAV audio on an existing voice profile."""
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", profile_id):
+        raise HTTPException(status_code=400, detail="Invalid profile_id format")
+
+    local_app_data = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+    upload_dir = Path(local_app_data) / "HTH" / "MeanVC2Profiles" / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    suffix = Path(file.filename or "ref.wav").suffix.lower()
+    if suffix not in (".wav", ".mp3", ".flac", ".ogg"):
+        suffix = ".wav"
+    tmp_path = upload_dir / f"ref_{os.urandom(8).hex()}{suffix}"
+
+    try:
+        content = await file.read()
+        if len(content) > 50 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="File too large (max 50 MB)")
+        with open(tmp_path, "wb") as f:
+            f.write(content)
+
+        updated = await adapter.attach_profile_reference(profile_id, str(tmp_path))
+        return _serialize_profile(adapter, updated)
+    except KeyError as e:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.put("/profiles/{profile_id}")
@@ -438,16 +490,42 @@ async def get_asset_status(adapter: Any = Depends(_get_meanvc2_adapter)) -> dict
 
 
 @router.post("/variant")
-async def set_model_variant(req: ModelVariantRequest, adapter: Any = Depends(_get_meanvc2_adapter)) -> dict[str, str]:
-    """Switch between 40ms (low latency) and 120ms (high quality) model variants."""
+async def set_model_variant(req: ModelVariantRequest, adapter: Any = Depends(_get_meanvc2_adapter)) -> dict[str, Any]:
+    """Switch between 40ms (low latency) and 120ms (high quality) model variants cleanly."""
     if req.variant not in ("40ms", "120ms"):
         raise HTTPException(status_code=400, detail="variant must be '40ms' or '120ms'")
+
+    was_running = getattr(adapter, "_state", EngineState.IDLE) in (EngineState.RUNNING, EngineState.MUTED)
+    if was_running:
+        await adapter.stop()
+
     adapter._cfg.model_variant = req.variant
     if hasattr(adapter, "_worker_loaded"):
         adapter._worker_loaded.clear()
     if hasattr(adapter, "_worker_target_set"):
         adapter._worker_target_set.clear()
-    return {"variant": req.variant, "note": "Restart engine to apply new variant"}
+
+    assets_ready = adapter._cfg.all_assets_ready()
+    download_triggered = False
+    if not assets_ready:
+        from hth.adapters.meanvc2.asset_manager import MeanVC2AssetManager
+
+        mgr = MeanVC2AssetManager(adapter._cfg.model_dir)
+        loop = asyncio.get_running_loop()
+        asyncio.create_task(loop.run_in_executor(None, mgr.download_hf_assets, req.variant))
+        download_triggered = True
+
+    return {
+        "variant": req.variant,
+        "stopped_active_stream": was_running,
+        "assets_ready": assets_ready,
+        "download_triggered": download_triggered,
+        "note": (
+            f"Switched to {req.variant}. Downloading missing variant weights in background."
+            if download_triggered
+            else f"Switched to {req.variant}. Ready to start conversion."
+        ),
+    }
 
 
 _MAX_AUDIO_WS_FRAME_BYTES = 262144  # 256 KB guard per binary PCM chunk
@@ -487,6 +565,7 @@ async def websocket_audio_stream(
 
     await websocket.accept()
     out_queue = adapter.subscribe_audio_out()
+    telemetry_queue = adapter.subscribe_telemetry() if hasattr(adapter, "subscribe_telemetry") else None
 
     async def _send_loop() -> None:
         try:
@@ -500,7 +579,22 @@ async def websocket_audio_stream(
         except Exception:
             pass
 
+    async def _telemetry_loop() -> None:
+        if telemetry_queue is None:
+            return
+        try:
+            while True:
+                item = await telemetry_queue.get()
+                if adapter._state == EngineState.ERROR:
+                    break
+                await websocket.send_json(item)
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            pass
+        except Exception:
+            pass
+
     sender_task = asyncio.create_task(_send_loop())
+    telemetry_task = asyncio.create_task(_telemetry_loop())
     try:
         while True:
             msg = await websocket.receive()
@@ -519,4 +613,7 @@ async def websocket_audio_stream(
         logger.warning("Remote audio WebSocket error", error=str(e))
     finally:
         sender_task.cancel()
+        telemetry_task.cancel()
         adapter.unsubscribe_audio_out(out_queue)
+        if telemetry_queue is not None and hasattr(adapter, "unsubscribe_telemetry"):
+            adapter.unsubscribe_telemetry(telemetry_queue)

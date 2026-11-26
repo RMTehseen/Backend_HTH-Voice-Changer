@@ -301,5 +301,50 @@ async def test_remote_audio_backpressure_drops_stale_chunks():
     assert adapter._inflight_chunks == adapter._max_inflight_chunks - 1
 
 
+def test_telemetry_subscription_and_unsubscribe():
+    """Telemetry queue receives metrics snapshots and unsubscribes cleanly."""
+    adapter = MeanVC2VoiceAdapter()
+    q = adapter.subscribe_telemetry()
+    adapter._last_inference_ms = 14.2
+    adapter._last_rtf = 0.09
+    adapter._overruns = 2
+    adapter._last_telemetry_ts = 0.0
+    adapter._emit_telemetry()
+
+    item = q.get_nowait()
+    assert item["type"] == "telemetry"
+    assert item["inference_ms"] == 14.2
+    assert item["rtf"] == 0.09
+    assert item["overruns"] == 2
+
+    adapter.unsubscribe_telemetry(q)
+    assert q not in adapter._telemetry_queues
+
+
+@pytest.mark.asyncio
+async def test_attach_profile_reference_and_has_reference(tmp_path):
+    """Attaching a valid WAV updates reference path and profile_has_reference."""
+    import wave
+
+    adapter = MeanVC2VoiceAdapter()
+    adapter._profile_store = VoiceProfileStore(str(tmp_path / "profiles"), auto_seed=True)
+    prof = adapter.list_voice_profiles()[0]
+    assert adapter.profile_has_reference(prof) is False
+
+    wav_path = tmp_path / "sample.wav"
+    sr = 16000
+    t = np.arange(int(sr * 1.5), dtype=np.float32) / sr
+    pcm = (0.3 * np.sin(2 * np.pi * 220 * t) * 32767).astype(np.int16)
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(pcm.tobytes())
+
+    updated = await adapter.attach_profile_reference(prof.profile_id, str(wav_path))
+    assert updated.reference_wav_path == str(wav_path)
+    assert adapter.profile_has_reference(updated) is True
+
+
 
 

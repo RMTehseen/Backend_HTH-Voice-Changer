@@ -19,6 +19,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from hth.api.dependencies import get_engine_service
@@ -257,6 +258,27 @@ async def list_voice_profiles(adapter: Any = Depends(_get_meanvc2_adapter)) -> l
     """List all saved voice profiles."""
     profiles = adapter.list_voice_profiles()
     return [_serialize_profile(adapter, p) for p in profiles]
+
+
+@router.get("/profiles/{profile_id}/reference")
+async def get_profile_reference_audio(
+    profile_id: str,
+    adapter: Any = Depends(_get_meanvc2_adapter),
+) -> FileResponse:
+    """Download the locally stored reference WAV audio for a voice profile."""
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", profile_id):
+        raise HTTPException(status_code=400, detail="Invalid profile_id format")
+
+    profile = adapter._profile_store.get(profile_id)
+    if not profile or not profile.reference_wav_path:
+        raise HTTPException(status_code=404, detail="Reference audio not found for profile")
+
+    base_dir = Path(adapter._profile_store.profile_dir).resolve()
+    ref_path = Path(profile.reference_wav_path).resolve()
+    if not ref_path.is_relative_to(base_dir) or not ref_path.is_file():
+        raise HTTPException(status_code=404, detail="Reference audio file unavailable")
+
+    return FileResponse(path=str(ref_path), media_type="audio/wav", filename=f"{profile_id}.wav")
 
 
 @router.post("/profiles/{profile_id}/reference")

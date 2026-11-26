@@ -95,7 +95,8 @@ class MeanVC2Worker:
         else:
             device = "cpu"
 
-        num_threads = config.get("num_threads", 4)
+        default_threads = min(4, max(1, os.cpu_count() or 2))
+        num_threads = int(config.get("num_threads", default_threads))
         torch.set_num_threads(num_threads)
         if hasattr(torch, "set_num_interop_threads"):
             try:
@@ -168,7 +169,10 @@ class MeanVC2Worker:
         runner.vc_spk_emb = None
         runner.vc_gtm_kv = None
         runner.variant = variant
-        runner.n_steps = int(config.get("cfm_steps", 1 if device == "cpu" else 2))
+        env_steps = os.environ.get("HTH_MEANVC2_CFM_STEPS", "").strip()
+        default_steps = int(env_steps) if env_steps.isdigit() and int(env_steps) >= 1 else (1 if device == "cpu" else 2)
+        runner.n_steps = int(config.get("cfm_steps", default_steps))
+        runner._warmed_up = False
 
         # Streaming params from upstream run_rt.py
         if variant == "120ms":
@@ -257,6 +261,13 @@ class MeanVC2Worker:
 
         with torch.no_grad():
             r.vc_gtm_kv = r.vc.gtm(r.vc_spk_emb)
+
+        # Run actual CUDA/JIT warmup once target speaker is set
+        if not getattr(r, "_warmed_up", False):
+            dummy = np.zeros(r.CHUNK, dtype=np.float32)
+            for _ in range(2):
+                self.process_chunk(dummy)
+            r._warmed_up = True
 
         # Reset streaming caches when target changes
         self._init_cache()

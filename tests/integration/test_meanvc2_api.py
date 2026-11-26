@@ -140,3 +140,68 @@ async def test_stream_mute(client: AsyncClient) -> None:
     assert resp2.status_code == 200
     assert resp2.json()["is_muted"] is False
 
+
+@pytest.mark.asyncio
+async def test_get_profile_reference_audio_and_path_jail(client: AsyncClient, tmp_path) -> None:
+    """GET /profiles/{id}/reference enforces ID format, path jail, and returns WAV bytes."""
+    import wave
+
+    import numpy as np
+
+    from hth.adapters.meanvc2.adapter import MeanVC2VoiceAdapter
+    from hth.adapters.meanvc2.voice_profile import VoiceProfileStore
+    from hth.api.routers.meanvc2 import _get_meanvc2_adapter
+
+    # Invalid profile_id -> 400
+    resp_bad = await client.get("/api/v1/meanvc2/profiles/bad!id/reference", headers=_HEADERS)
+    assert resp_bad.status_code == 400
+
+    profiles_dir = tmp_path / "profiles"
+    adapter = MeanVC2VoiceAdapter()
+    adapter._profile_store = VoiceProfileStore(str(profiles_dir), auto_seed=True)
+
+    app = client._transport.app  # type: ignore[attr-defined]
+    app.dependency_overrides[_get_meanvc2_adapter] = lambda: adapter
+    try:
+        # No reference WAV attached yet -> 404
+        resp_missing = await client.get(
+            "/api/v1/meanvc2/profiles/profile-female-eva/reference", headers=_HEADERS
+        )
+        assert resp_missing.status_code == 404
+
+        # Path outside profile_dir (jail bypass attempt) -> 404
+        outside_wav = tmp_path / "outside.wav"
+        outside_wav.write_bytes(b"RIFFdemo")
+        prof = adapter._profile_store.get("profile-female-eva")
+        assert prof is not None
+        prof.reference_wav_path = str(outside_wav)
+        adapter._profile_store.save(prof)
+
+        resp_jail = await client.get(
+            "/api/v1/meanvc2/profiles/profile-female-eva/reference", headers=_HEADERS
+        )
+        assert resp_jail.status_code == 404
+
+        # Valid WAV inside profile_dir -> 200 audio/wav
+        inside_dir = profiles_dir / "references"
+        inside_dir.mkdir(parents=True, exist_ok=True)
+        inside_wav = inside_dir / "profile-female-eva.wav"
+        pcm = (np.zeros(1600, dtype=np.int16)).tobytes()
+        with wave.open(str(inside_wav), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(pcm)
+        prof.reference_wav_path = str(inside_wav)
+        adapter._profile_store.save(prof)
+
+        resp_ok = await client.get(
+            "/api/v1/meanvc2/profiles/profile-female-eva/reference", headers=_HEADERS
+        )
+        assert resp_ok.status_code == 200
+        assert resp_ok.headers["content-type"].startswith("audio/wav")
+        assert resp_ok.content.startswith(b"RIFF")
+    finally:
+        app.dependency_overrides.clear()
+
+

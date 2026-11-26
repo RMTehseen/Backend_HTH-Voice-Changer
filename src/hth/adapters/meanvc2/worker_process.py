@@ -112,12 +112,10 @@ class MeanVC2Worker:
         spk_model_path = config["speaker_model_path"]
         wavlm_cfg_path = config.get("wavlm_config_path", "")
 
-        # ASR
+        # ASR (TorchScript traced model must stay on CPU — matches upstream run_rt.py)
         _emit({"event": "progress", "step": "loading_asr"})
-        asr = torch.jit.load(asr_ckpt)
+        asr = torch.jit.load(asr_ckpt, map_location="cpu")
         asr.eval()
-        if device == "cuda":
-            asr = asr.to(device)
 
         # VC model
         _emit({"event": "progress", "step": "loading_vc"})
@@ -209,13 +207,13 @@ class MeanVC2Worker:
     def _init_cache(self):
         import torch
         r = self._runner
-        dev = r.device if r else "cpu"
         r.samples_cache = np.zeros(0, dtype=np.float32)
         r.frame_cache = None
         r.encoder_output_cache = None
         r.asr_offset = r._asr_offset_init
-        r.asr_att_cache = torch.zeros(6, 4, r._required_cache_size, 128, device=dev)
-        r.asr_cnn_cache = torch.zeros(6, 1, 256, 8, device=dev)
+        # ASR stays on CPU so its caches must remain CPU tensors
+        r.asr_att_cache = torch.zeros(6, 4, r._required_cache_size, 128)
+        r.asr_cnn_cache = torch.zeros(6, 1, 256, 8)
         r.vc_kv_cache = None
         r.vc_offset = 0
         r.noise_cache = None
@@ -301,11 +299,11 @@ class MeanVC2Worker:
             bns = []
             i = 0
             while i + r._bn_window <= fbanks.shape[0]:
-                fb = fbanks[i:i + r._bn_window].unsqueeze(0).to(r.device)
+                fb = fbanks[i:i + r._bn_window].unsqueeze(0)
                 out, r.asr_att_cache, r.asr_cnn_cache = r.asr(
                     fb,
-                    torch.tensor(r.asr_offset, dtype=torch.int64, device=r.device),
-                    torch.tensor(r._required_cache_size, dtype=torch.int64, device=r.device),
+                    torch.tensor(r.asr_offset, dtype=torch.int64),
+                    torch.tensor(r._required_cache_size, dtype=torch.int64),
                     r.asr_att_cache, r.asr_cnn_cache,
                 )
                 bns.append(out.squeeze(0).detach())

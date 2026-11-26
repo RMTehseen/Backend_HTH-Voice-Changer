@@ -129,6 +129,7 @@ async def get_meanvc2_status(adapter: Any = Depends(_get_meanvc2_adapter)) -> di
         "worker_loaded": bool(worker_loaded and worker_loaded.is_set()),
         "target_set": bool(target_set and target_set.is_set()),
         "engine_state": adapter._state.value if hasattr(adapter._state, "value") else str(adapter._state),
+        "last_error": getattr(adapter, "_last_error", None),
         "is_muted": getattr(adapter, "_is_muted", False),
         "monitor_enabled": getattr(bridge, "monitor_enabled", False) if bridge else False,
         "monitor_volume": getattr(bridge, "monitor_volume", 1.0) if bridge else 1.0,

@@ -332,8 +332,16 @@ class MeanVC2VoiceAdapter:
                             sound_effect=str(getattr(profile, "sound_effect", "none") or "none"),
                             volume_gain=float(getattr(profile, "volume_gain", 1.0) or 1.0),
                         )
-                    elif profile and profile.volume_gain is not None and float(profile.volume_gain) != 1.0:
-                        samples = np.tanh(samples * float(profile.volume_gain)).astype(np.float32)
+                    elif profile and profile.volume_gain is not None and abs(float(profile.volume_gain) - 1.0) > 0.05:
+                        # Apply volume as LINEAR gain (not tanh — tanh was causing saturation
+                        # distortion making the voice sound compressed/robotic).
+                        # Normalize if the gain would cause clipping instead of hard-clipping.
+                        vol = float(profile.volume_gain)
+                        samples = samples * vol
+                        peak = float(np.abs(samples).max())
+                        if peak > 0.95:
+                            samples = samples * (0.95 / peak)
+                        samples = samples.astype(np.float32)
                     self._emit_remote_bytes(samples.astype(np.float32).tobytes())
             self._last_inference_ms = msg.get("inference_ms", 0.0)
             self._last_rtf = msg.get("rtf", 0.0)

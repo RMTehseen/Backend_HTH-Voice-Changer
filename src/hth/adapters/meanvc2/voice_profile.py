@@ -11,8 +11,6 @@ from typing import Optional
 
 from hth.core.logging import get_logger
 
-from .default_references import get_reference_path as _bundled_wav
-
 logger = get_logger("hth.adapters.meanvc2.profiles")
 
 
@@ -81,26 +79,33 @@ class VoiceProfileStore:
         if not self._profiles and auto_seed:
             self._seed_default_profiles()
         elif auto_seed and self._profiles:
-            # Backfill bundled WAV paths for any existing profiles that have none.
-            # This fixes profiles seeded before bundled WAVs were introduced.
+            # Attach real reference WAVs from local references/ folder if present on disk
+            refs_dir = self.profile_dir / "references"
             changed = False
-            for pid, profile in self._profiles.items():
-                if not profile.reference_wav_path:
-                    wav = _bundled_wav(pid)
-                    if wav:
-                        profile.reference_wav_path = wav
-                        changed = True
+            if refs_dir.is_dir():
+                for pid, profile in self._profiles.items():
+                    if not profile.reference_wav_path:
+                        cand = refs_dir / f"{pid}.wav"
+                        if cand.is_file():
+                            profile.reference_wav_path = str(cand)
+                            changed = True
             if changed:
                 self._save_index()
-                logger.info("Backfilled bundled reference WAV paths for existing profiles")
+                logger.info("Linked local reference WAVs for existing profiles")
 
     def _seed_default_profiles(self) -> None:
         """Seed pre-configured curated voice profiles if store is empty (e.g. cloud or new instance)."""
 
         def _ref(pid: str) -> str:
-            """Return bundled WAV path for profile, or '' if not found."""
-            return _bundled_wav(pid) or ""
+            """Return real reference WAV from profile_dir/references if present on disk, else ''."""
+            cand = self.profile_dir / "references" / f"{pid}.wav"
+            return str(cand) if cand.is_file() else ""
 
+        # DSP defaults: ALL neutral — MeanVC2 handles conversion; post-DSP only degrades quality.
+        # pitch_shift=0: no extra semitone shift on top of neural conversion.
+        # timbre_ratio=1.0: no formant stretch beyond the model output.
+        # volume_gain=1.0: no gain (tanh distortion was caused by values >1.0).
+        # sound_effect="none": no reverb/room/telephone — those make voice sound processed.
         defaults = [
             VoiceProfile(
                 profile_id="profile-female-eva",
@@ -108,10 +113,10 @@ class VoiceProfileStore:
                 avatar_id="female_eva",
                 category="Female",
                 badge="AI",
-                pitch_shift=2.5,
-                timbre_ratio=1.05,
-                volume_gain=1.25,
-                sound_effect="room",
+                pitch_shift=0.0,
+                timbre_ratio=1.0,
+                volume_gain=1.0,
+                sound_effect="none",
                 favorite=True,
                 consent_declared=True,
                 consent_statement="Consented internal reference voice for HTH Real Voice Changer.",
@@ -128,7 +133,7 @@ class VoiceProfileStore:
                 pitch_shift=0.0,
                 timbre_ratio=1.0,
                 volume_gain=1.0,
-                sound_effect="telephone",
+                sound_effect="none",
                 favorite=False,
                 consent_declared=True,
                 consent_statement="Consented internal reference voice for HTH Real Voice Changer.",
@@ -142,10 +147,10 @@ class VoiceProfileStore:
                 avatar_id="female_zara",
                 category="Female",
                 badge="PRO",
-                pitch_shift=1.0,
-                timbre_ratio=1.05,
+                pitch_shift=0.0,
+                timbre_ratio=1.0,
                 volume_gain=1.0,
-                sound_effect="room",
+                sound_effect="none",
                 favorite=True,
                 consent_declared=True,
                 consent_statement="Consented internal reference voice for HTH Real Voice Changer.",
@@ -159,8 +164,8 @@ class VoiceProfileStore:
                 avatar_id="male_bilal",
                 category="Male",
                 badge="AI",
-                pitch_shift=-1.0,
-                timbre_ratio=0.95,
+                pitch_shift=0.0,
+                timbre_ratio=1.0,
                 volume_gain=1.0,
                 sound_effect="none",
                 favorite=False,
@@ -176,8 +181,8 @@ class VoiceProfileStore:
                 avatar_id="female_source",
                 category="Character",
                 badge="NEW",
-                pitch_shift=3.0,
-                timbre_ratio=1.1,
+                pitch_shift=0.0,
+                timbre_ratio=1.0,
                 volume_gain=1.0,
                 sound_effect="none",
                 favorite=False,
@@ -193,10 +198,10 @@ class VoiceProfileStore:
                 avatar_id="character_ratke",
                 category="Character",
                 badge="AI",
-                pitch_shift=-2.0,
-                timbre_ratio=0.9,
+                pitch_shift=0.0,
+                timbre_ratio=1.0,
                 volume_gain=1.0,
-                sound_effect="radio",
+                sound_effect="none",
                 favorite=False,
                 consent_declared=True,
                 consent_statement="Consented internal reference voice for HTH Real Voice Changer.",
@@ -210,9 +215,9 @@ class VoiceProfileStore:
                 avatar_id="female_ananya",
                 category="Female",
                 badge="HINDI",
-                pitch_shift=1.5,
-                timbre_ratio=1.05,
-                volume_gain=1.1,
+                pitch_shift=0.0,
+                timbre_ratio=1.0,
+                volume_gain=1.0,
                 sound_effect="none",
                 favorite=True,
                 consent_declared=True,
@@ -227,10 +232,10 @@ class VoiceProfileStore:
                 avatar_id="female_priya",
                 category="Female",
                 badge="DESI",
-                pitch_shift=2.0,
-                timbre_ratio=1.08,
+                pitch_shift=0.0,
+                timbre_ratio=1.0,
                 volume_gain=1.0,
-                sound_effect="radio",
+                sound_effect="none",
                 favorite=True,
                 consent_declared=True,
                 consent_statement="Consented internal natural reference voice for HTH Voice Changer.",
@@ -244,9 +249,9 @@ class VoiceProfileStore:
                 avatar_id="female_sana",
                 category="Female",
                 badge="URDU",
-                pitch_shift=1.0,
-                timbre_ratio=1.04,
-                volume_gain=1.15,
+                pitch_shift=0.0,
+                timbre_ratio=1.0,
+                volume_gain=1.0,
                 sound_effect="none",
                 favorite=True,
                 consent_declared=True,
@@ -261,8 +266,8 @@ class VoiceProfileStore:
                 avatar_id="female_chloe",
                 category="Female",
                 badge="MELODIC",
-                pitch_shift=2.5,
-                timbre_ratio=1.1,
+                pitch_shift=0.0,
+                timbre_ratio=1.0,
                 volume_gain=1.0,
                 sound_effect="none",
                 favorite=True,

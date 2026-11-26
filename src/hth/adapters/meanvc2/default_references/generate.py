@@ -1,89 +1,195 @@
 """
-Generate synthetic formant-based reference WAV files for HTH default voice profiles.
+Generate synthetic speech-like reference WAV files for HTH default voice profiles.
 
-These are algorithmically-generated speaker reference signals owned by HTH Real Voice Changer.
-They are generated on first run (or when missing) using only Python stdlib — no external deps.
+Improvement over previous version: Instead of pure sinusoidal tones (which produce
+poor speaker embeddings — MeanVC2's speaker encoder expects speech, not sine waves),
+this version synthesises pseudo-speech using:
+
+  - Glottal pulse model: asymmetric sawtooth-like waveform that approximates the
+    Liljencrants-Fant glottal source (more harmonically rich than pure sine)
+  - Natural F0 contour: slowly falling pitch (declarative speech intonation)
+  - Jitter: ±1.5% random F0 perturbation per period (mimics vocal cord irregularity)
+  - Shimmer: ±1.5% amplitude perturbation per period
+  - Syllabic amplitude modulation: 4–5 Hz AM simulates syllable-rate rhythm
+  - Vowel formant transitions: 5-vowel (a→e→i→o→u) cycle over the utterance
+  - Breathiness noise floor: 5–10% wideband noise mixed in
+  - Proper onset/offset fades: 80ms attack, 150ms release
+
+Result: speaker embeddings that capture distinct pitch ranges, formant structures,
+and prosodic patterns — far more useful for zero-shot voice conversion than tones.
+
+All generated audio is owned by HTH Real Voice Changer (algorithmic, no recordings).
 Consented internal reference per AGENTS.md Rule 4.
-
-Each WAV: 16 kHz, mono, 16-bit PCM, ~4 seconds.
-Distinct fundamental frequency + formant profile per voice type.
 """
 from __future__ import annotations
 
 import math
 import os
+import random
 import struct
 import wave
 from pathlib import Path
 
 SAMPLE_RATE = 16000
-DURATION = 4.0
+DURATION = 5.0  # seconds — longer = richer embedding
 
-# (profile_id, F0_hz, formants[(F1,amp),(F2,amp),(F3,amp)], vibrato_rate, vibrato_depth, breathiness)
-_PROFILES: list[tuple] = [
-    # --- Female voices: F0 170–240 Hz, higher formants ---
-    ("profile-female-eva",      200.0, [(800, 1.0), (2200, 0.8), (2900, 0.4)], 5.5, 0.015, 0.07),
-    ("profile-female-ayesha",   185.0, [(750, 1.0), (2100, 0.8), (2800, 0.4)], 5.0, 0.015, 0.09),
-    ("profile-female-zara",     210.0, [(820, 1.0), (2300, 0.9), (3000, 0.4)], 6.0, 0.015, 0.06),
-    ("profile-female-ananya",   195.0, [(790, 1.0), (2150, 0.8), (2850, 0.4)], 5.2, 0.015, 0.08),
-    ("profile-female-priya",    205.0, [(810, 1.0), (2250, 0.8), (2950, 0.4)], 5.8, 0.015, 0.07),
-    ("profile-female-sana",     190.0, [(770, 1.0), (2080, 0.8), (2780, 0.4)], 5.3, 0.015, 0.09),
-    ("profile-female-chloe",    220.0, [(850, 1.0), (2400, 0.9), (3100, 0.4)], 6.2, 0.015, 0.06),
-    # --- Male voice: F0 ~115 Hz, lower formants ---
-    ("profile-male-bilal",      115.0, [(650, 1.0), (1200, 0.7), (2500, 0.3)], 4.5, 0.012, 0.05),
-    # --- Character voices ---
-    ("profile-female-source",   240.0, [(900, 1.0), (2600, 1.0), (3200, 0.5)], 7.0, 0.015, 0.05),  # Anime
-    ("profile-character-ratke",  95.0, [(600, 1.0), (1100, 0.6), (2400, 0.4)], 3.5, 0.010, 0.12),  # Cyber
+# English vowel formants (F1, F2, F3) in Hz — ITU-T P.501 approximate
+_VOWELS: list[tuple[float, float, float]] = [
+    (730, 1090, 2440),  # /a/ as in "father"
+    (530, 1840, 2480),  # /e/ as in "bed"
+    (270, 2290, 3010),  # /i/ as in "see"
+    (570, 840,  2410),  # /o/ as in "go"
+    (300, 870,  2240),  # /u/ as in "blue"
 ]
+
+# (profile_id, F0_mean, F0_range, breathiness, syllable_rate, gender_weight)
+# gender_weight: 1.0=female-bright, 0.5=female-soft, 0.0=male
+_PROFILES: list[tuple] = [
+    ("profile-female-eva",      200.0, 30.0, 0.06, 4.8, 1.00),
+    ("profile-female-ayesha",   183.0, 22.0, 0.08, 4.3, 0.90),
+    ("profile-female-zara",     213.0, 35.0, 0.05, 5.2, 1.00),
+    ("profile-female-ananya",   194.0, 28.0, 0.07, 4.5, 0.85),
+    ("profile-female-priya",    207.0, 32.0, 0.06, 4.9, 0.95),
+    ("profile-female-sana",     189.0, 24.0, 0.09, 4.1, 0.80),
+    ("profile-female-chloe",    221.0, 38.0, 0.05, 5.5, 1.00),
+    ("profile-male-bilal",      113.0, 18.0, 0.04, 3.8, 0.00),
+    ("profile-female-source",   245.0, 45.0, 0.04, 6.0, 1.00),  # Anime: high, wide range
+    ("profile-character-ratke",  93.0, 12.0, 0.11, 3.2, 0.00),  # Cyber: low, raspy
+]
+
+
+def _glottal_pulse(phase: float) -> float:
+    """
+    Simplified LF-inspired glottal source waveform.
+    Produces a waveform with steeper closing phase (like a real glottis),
+    giving richer odd+even harmonics compared to a pure sine.
+    phase in [0, 1).
+    """
+    if phase < 0.65:
+        # Open phase: smooth rise and peak
+        t = phase / 0.65
+        return math.sin(math.pi * t) ** 2
+    else:
+        # Closing phase: sharp linear fall (glottal closure)
+        t = (phase - 0.65) / 0.35
+        return 1.0 - t
+
+
+def _vowel_formant_boost(sample: float, f0: float, t: float,
+                          vowel_idx: int, famp: float) -> float:
+    """
+    Add formant coloring by boosting harmonics nearest to formant frequencies.
+    Rotates through 5 vowels to give spectral diversity for embedding extraction.
+    """
+    f1, f2, f3 = _VOWELS[vowel_idx % 5]
+    boost = 0.0
+    # Nearest harmonic to each formant
+    for ffreq, weight in [(f1, 0.6), (f2, 0.4), (f3, 0.2)]:
+        nh = max(1, round(ffreq / max(f0, 1.0)))
+        if 1 <= nh <= 16:
+            boost += weight * math.sin(2 * math.pi * nh * f0 * t)
+    return sample + famp * boost
 
 
 def _generate_wav(
     profile_id: str,
-    f0: float,
-    formants: list[tuple[float, float]],
-    vibrato_rate: float,
-    vibrato_depth: float,
+    f0_mean: float,
+    f0_range: float,
     breathiness: float,
+    syllable_rate: float,
+    gender_weight: float,
     out_dir: Path,
 ) -> Path:
-    """Synthesise a voice-like signal and write it as a 16kHz mono WAV."""
-    import random
+    """Synthesise a speech-like signal and write it as a 16kHz mono WAV."""
     rng = random.Random(hash(profile_id) & 0xFFFF_FFFF)
-
     n = int(SAMPLE_RATE * DURATION)
+
+    # Pre-generate per-period jitter/shimmer tables (varying F0 and amplitude)
+    # We'll apply these continuously during synthesis
     buf: list[float] = []
+
+    # State variables
+    phase = 0.0           # Glottal phase [0, 1)
+
+    # Syllabic AM envelope state
+    syl_phase = rng.random()  # randomise start of syllabic cycle
+
+    # Vowel cycle: advance one vowel every ~300ms
+    vowel_period = 0.30  # seconds per vowel
+    formant_amp = 0.35   # formant contribution amplitude
+
+    # Jitter/shimmer state
+    jitter_sigma = 0.015  # ±1.5% F0 jitter
+    shimmer_sigma = 0.015  # ±1.5% amplitude shimmer
+    cur_jitter = 1.0
+    cur_shimmer = 1.0
+    # Smoothed jitter/shimmer (updated at glottal closure = period boundary)
+    period_counter = 0
 
     for i in range(n):
         t = i / SAMPLE_RATE
-        # Vibrato on fundamental
-        f0v = f0 * (1.0 + vibrato_depth * math.sin(2 * math.pi * vibrato_rate * t))
-        s = 0.0
-        # Glottal source: 8 harmonics with spectral tilt −10 dB/oct
+
+        # Natural F0 contour: falling intonation over utterance with mild random walk
+        # Declarative speech falls ~15% from start to end
+        progress = t / DURATION
+        f0_contour = f0_mean * (1.0 + 0.08 * math.sin(2 * math.pi * 0.4 * t)
+                                - 0.12 * progress)
+        f0_contour = max(f0_mean * 0.7, min(f0_mean * 1.3, f0_contour))
+
+        # Apply jitter (smoothed, updated per period)
+        f0_inst = f0_contour * cur_jitter
+
+        # Advance glottal phase
+        phase += f0_inst / SAMPLE_RATE
+        if phase >= 1.0:
+            phase -= 1.0
+            period_counter += 1
+            # Update jitter/shimmer at each glottal closure (pitch period boundary)
+            # Smooth toward new random target
+            jitter_target = 1.0 + rng.gauss(0, jitter_sigma)
+            shimmer_target = 1.0 + rng.gauss(0, shimmer_sigma)
+            cur_jitter = cur_jitter * 0.7 + jitter_target * 0.3
+            cur_shimmer = cur_shimmer * 0.7 + shimmer_target * 0.3
+
+        # Glottal source signal
+        voiced = _glottal_pulse(phase) * cur_shimmer
+
+        # 8 harmonics with spectral tilt −9 dB/octave (speech-like)
+        harmonic_sum = 0.0
         for h in range(1, 9):
-            s += (1.0 / h ** 1.3) * math.sin(2 * math.pi * h * f0v * t)
-        # Formant boost: excite nearest harmonic of each formant frequency
-        for ffreq, famp in formants:
-            nh = max(1, round(ffreq / f0))
-            if nh <= 14:
-                s += famp * math.sin(2 * math.pi * nh * f0v * t)
-        # Breathiness (noise)
+            amp = 1.0 / (h ** 1.5)
+            harmonic_sum += amp * math.sin(2 * math.pi * h * f0_inst * t)
+
+        # Mix glottal pulse with harmonic sum (blend ratio)
+        source = 0.4 * voiced + 0.6 * harmonic_sum
+
+        # Vowel formant coloring (cycles through 5 vowels)
+        vowel_idx = int(t / vowel_period) % 5
+        source = _vowel_formant_boost(source, f0_inst, t, vowel_idx, formant_amp)
+
+        # Syllabic amplitude envelope: 4–5 Hz rhythm mimicking syllables
+        syl_phase += syllable_rate / SAMPLE_RATE
+        syl_env = 0.65 + 0.35 * (0.5 + 0.5 * math.sin(2 * math.pi * syl_phase))
+        source *= syl_env
+
+        # Breathiness: wideband noise mixed with the voiced signal
         noise = (rng.random() * 2.0 - 1.0) * breathiness
-        s = s * (1.0 - breathiness) + noise
+        s = source * (1.0 - breathiness * 0.5) + noise
+
         buf.append(s)
 
-    # Fade in / fade out
-    att = int(0.05 * SAMPLE_RATE)
-    rel = int(0.10 * SAMPLE_RATE)
+    # Amplitude envelope: 80ms attack, 150ms release
+    att = int(0.08 * SAMPLE_RATE)
+    rel = int(0.15 * SAMPLE_RATE)
     for i in range(att):
-        buf[i] *= i / att
+        buf[i] *= (i / att) ** 2  # quadratic onset (more natural)
     for i in range(rel):
-        buf[n - 1 - i] *= i / rel
+        buf[n - 1 - i] *= (i / rel)
 
-    # Normalise to −3 dBFS
+    # Normalise to −4 dBFS (peak = 0.63) — leave headroom for embedding processor
     peak = max(abs(x) for x in buf)
     if peak > 1e-6:
-        scale = 0.70 / peak
-        buf = [x * scale for x in buf]
+        buf = [x * (0.63 / peak) for x in buf]
 
     # Encode as 16-bit signed PCM
     pcm = b"".join(
@@ -104,8 +210,7 @@ def _generate_wav(
 def ensure_reference_wavs(out_dir: Path | None = None, force: bool = False) -> dict[str, str]:
     """
     Generate any missing reference WAVs in *out_dir* (defaults to this package directory).
-
-    Returns a dict mapping profile_id → absolute WAV path for every profile.
+    Returns a dict mapping profile_id → absolute WAV path.
     Already-present files are skipped unless *force* is True.
     """
     if out_dir is None:
@@ -115,10 +220,10 @@ def ensure_reference_wavs(out_dir: Path | None = None, force: bool = False) -> d
     result: dict[str, str] = {}
 
     for row in _PROFILES:
-        pid, f0, formants, vr, vd, br = row
+        pid, f0, f0r, br, sr, gw = row
         wav_path = out_dir / f"{pid}.wav"
         if force or not wav_path.is_file():
-            _generate_wav(pid, f0, formants, vr, vd, br, out_dir)
+            _generate_wav(pid, f0, f0r, br, sr, gw, out_dir)
         result[pid] = str(wav_path)
 
     return result
@@ -132,5 +237,5 @@ if __name__ == "__main__":
     paths = ensure_reference_wavs(out_dir=out, force=force)
     for pid, p in paths.items():
         sz = os.path.getsize(p)
-        print(f"  {pid}: {p}  ({sz} bytes)")
+        print(f"  {pid}: {sz} bytes")
     print(f"Done — {len(paths)} WAVs ready.")

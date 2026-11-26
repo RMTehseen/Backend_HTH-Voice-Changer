@@ -180,7 +180,8 @@ class MeanVC2Worker:
         runner.vc_gtm_kv = None
         runner.variant = variant
         env_steps = os.environ.get("HTH_MEANVC2_CFM_STEPS", "").strip()
-        default_steps = int(env_steps) if env_steps.isdigit() and int(env_steps) >= 1 else 1
+        cuda_default = 2 if device == "cuda" else 1
+        default_steps = int(env_steps) if env_steps.isdigit() and int(env_steps) >= 1 else cuda_default
         runner.n_steps = int(config.get("cfm_steps", default_steps))
         runner.use_fp16 = (
             device == "cuda"
@@ -454,7 +455,10 @@ class MeanVC2Worker:
 
         if not wav_parts:
             return None
-        return np.concatenate(wav_parts)
+        out_wav = np.concatenate(wav_parts)
+        if not np.isfinite(out_wav).all():
+            out_wav = np.nan_to_num(out_wav, nan=0.0, posinf=0.98, neginf=-0.98)
+        return np.clip(out_wav, -0.98, 0.98).astype(np.float32)
 
     def warmup(self) -> None:
         """Warmup the model, then reset caches."""

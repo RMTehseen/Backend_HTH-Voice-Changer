@@ -276,5 +276,30 @@ async def test_remote_audio_subscription_and_bypass():
     assert q not in adapter._remote_audio_queues
 
 
+def test_meanvc2_config_device_and_variant_env(monkeypatch):
+    """HTH_MEANVC2_DEVICE and HTH_MEANVC2_VARIANT override config defaults."""
+    monkeypatch.setenv("HTH_MEANVC2_DEVICE", "cuda")
+    monkeypatch.setenv("HTH_MEANVC2_VARIANT", "120ms")
+    cfg = MeanVC2Config()
+    assert cfg.device == "cuda"
+    assert cfg.model_variant == "120ms"
+
+
+@pytest.mark.asyncio
+async def test_remote_audio_backpressure_drops_stale_chunks():
+    """When inflight worker chunks reach max limit, stale incoming frames drop cleanly."""
+    adapter = MeanVC2VoiceAdapter()
+    adapter._state = EngineState.RUNNING
+    adapter._active_profile_id = "profile-female-eva"
+    adapter._inflight_chunks = adapter._max_inflight_chunks
+
+    samples = np.zeros(160, dtype=np.float32)
+    await adapter.push_remote_audio(samples)
+    assert adapter._overruns == 1
+
+    await adapter._handle_worker_event({"event": "audio_buffering"})
+    assert adapter._inflight_chunks == adapter._max_inflight_chunks - 1
+
+
 
 

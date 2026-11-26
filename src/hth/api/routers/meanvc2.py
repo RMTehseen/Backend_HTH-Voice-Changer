@@ -97,6 +97,24 @@ class ModelVariantRequest(BaseModel):
     variant: str  # "40ms" or "120ms"
 
 
+def _detect_cpu_name() -> str:
+    """Detect host CPU model name cleanly across Windows and Linux/Colab."""
+    import platform
+
+    if os.name != "nt":
+        try:
+            with open("/proc/cpuinfo", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.lower().startswith("model name"):
+                        name = line.split(":", 1)[1].strip()
+                        if name:
+                            return name
+        except OSError:
+            pass
+    proc = platform.processor() or platform.machine() or "CPU"
+    return proc.strip()
+
+
 @router.get("/status")
 async def get_meanvc2_status(adapter: Any = Depends(_get_meanvc2_adapter)) -> dict[str, Any]:
     """Get MeanVC2 asset/model readiness status."""
@@ -109,14 +127,16 @@ async def get_meanvc2_status(adapter: Any = Depends(_get_meanvc2_adapter)) -> di
 
     # Dynamic hardware detection (supports local CPU fallback and Cloud GPU / CUDA)
     is_cuda = False
-    device_name = "Intel Core i5-8350U (CPU)"
-    measured_rtf = getattr(adapter, "_last_rtf", 2.39)
+    cpu_model = _detect_cpu_name()
+    is_cloud_mode = os.environ.get("HTH_CLOUD_MODE", "false").lower() in ("true", "1")
+    device_name = f"Cloud CPU ({cpu_model})" if is_cloud_mode else f"{cpu_model} (CPU)"
+    measured_rtf = getattr(adapter, "_last_rtf", 2.39) or (1.0 if is_cloud_mode else 2.39)
     try:
         import torch
         if torch.cuda.is_available():
             is_cuda = True
             device_name = f"NVIDIA {torch.cuda.get_device_name(0)}"
-            measured_rtf = 0.08
+            measured_rtf = getattr(adapter, "_last_rtf", 0.0) or 0.08
     except Exception:
         pass
 
@@ -130,13 +150,14 @@ async def get_meanvc2_status(adapter: Any = Depends(_get_meanvc2_adapter)) -> di
         "target_set": bool(target_set and target_set.is_set()),
         "engine_state": adapter._state.value if hasattr(adapter._state, "value") else str(adapter._state),
         "last_error": getattr(adapter, "_last_error", None),
+        "overruns": getattr(adapter, "_overruns", 0),
         "is_muted": getattr(adapter, "_is_muted", False),
         "monitor_enabled": getattr(bridge, "monitor_enabled", False) if bridge else False,
         "monitor_volume": getattr(bridge, "monitor_volume", 1.0) if bridge else 1.0,
         "output_volume": getattr(bridge, "output_volume", 1.0) if bridge else 1.0,
         "hardware_info": {
             "device": "cuda" if is_cuda else "cpu",
-            "cpu_model": "Intel Core i5-8350U",
+            "cpu_model": cpu_model,
             "device_name": device_name,
             "is_cuda_ready": is_cuda,
             "realtime_viable": is_cuda,
@@ -144,7 +165,7 @@ async def get_meanvc2_status(adapter: Any = Depends(_get_meanvc2_adapter)) -> di
             "recommendation": (
                 f"{device_name} Active — Sub-40ms zero-latency real-time voice conversion running."
                 if is_cuda
-                else "Current CPU runs with RTF ~2.39 (Preview & Offline mode). NVIDIA GPU with CUDA required for sustained live calls."
+                else f"Running on {device_name} (RTF ~{measured_rtf:.2f}). NVIDIA GPU with CUDA required for sub-40ms zero-delay live calls."
             ),
         },
     }
@@ -424,6 +445,8 @@ async def set_model_variant(req: ModelVariantRequest, adapter: Any = Depends(_ge
     adapter._cfg.model_variant = req.variant
     if hasattr(adapter, "_worker_loaded"):
         adapter._worker_loaded.clear()
+    if hasattr(adapter, "_worker_target_set"):
+        adapter._worker_target_set.clear()
     return {"variant": req.variant, "note": "Restart engine to apply new variant"}
 
 

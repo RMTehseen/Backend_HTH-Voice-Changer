@@ -76,6 +76,9 @@ class MeanVC2VoiceAdapter:
         self._output_queue: Deque[np.ndarray] = collections.deque(maxlen=self._cfg.max_output_queue)
         self._processing_task: Optional[asyncio.Task] = None
         self._remote_audio_queues: set[asyncio.Queue[bytes]] = set()
+        self._inflight_chunks: int = 0
+        self._max_inflight_chunks: int = 3
+        self._last_stderr_tail: Deque[str] = collections.deque(maxlen=10)
         from .dsp_effects import DSPPostProcessor
         self._remote_dsp = DSPPostProcessor()
 
@@ -173,6 +176,7 @@ class MeanVC2VoiceAdapter:
             async for line in proc.stderr:
                 text = line.decode("utf-8", errors="replace").strip()
                 if text:
+                    self._last_stderr_tail.append(text[:300])
                     logger.warning("Worker stderr", text=text[:300])
         except Exception:
             pass
@@ -193,9 +197,27 @@ class MeanVC2VoiceAdapter:
                     logger.warning("Worker sent non-JSON", line=line[:100])
                     continue
                 await self._handle_worker_event(msg)
+            # EOF reached: detect unexpected worker death while active
+            if self._state in (EngineState.RUNNING, EngineState.STARTING):
+                rc = proc.returncode
+                if rc is None:
+                    try:
+                        rc = await asyncio.wait_for(proc.wait(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        rc = None
+                tail = " | ".join(self._last_stderr_tail)
+                err_msg = f"MeanVC2 worker exited unexpectedly (code={rc})" + (f": {tail}" if tail else "")
+                logger.error("Worker EOF crash detected", error=err_msg)
+                self._state = EngineState.ERROR
+                self._is_muted = True
+                self._last_error = err_msg
+                self._worker_ready.set()
+                self._worker_loaded.set()
+                self._worker_target_set.set()
         except Exception as e:
             logger.error("Worker reader task error", error=str(e))
             self._state = EngineState.ERROR
+            self._is_muted = True
             self._last_error = str(e)
 
     def subscribe_audio_out(self) -> asyncio.Queue[bytes]:
@@ -228,6 +250,11 @@ class MeanVC2VoiceAdapter:
             self._frames_processed += 1
             self._emit_remote_bytes(samples.astype(np.float32).tobytes())
             return
+        # Backpressure guard: drop stale frames if worker falls behind (prevents unbounded lag)
+        if self._inflight_chunks >= self._max_inflight_chunks:
+            self._overruns += 1
+            return
+        self._inflight_chunks += 1
         b64 = base64.b64encode(samples.astype(np.float32).tobytes()).decode()
         await self._send_to_worker({"cmd": "process_chunk", "data_b64": b64})
 
@@ -246,6 +273,7 @@ class MeanVC2VoiceAdapter:
         elif event == "warning":
             logger.warning("Worker warning", message=msg.get("message", ""))
         elif event == "audio_out":
+            self._inflight_chunks = max(0, self._inflight_chunks - 1)
             if not self._is_muted and not self._passthrough_enabled:
                 raw = base64.b64decode(msg["data_b64"])
                 samples = np.frombuffer(raw, dtype=np.float32).copy()
@@ -265,8 +293,9 @@ class MeanVC2VoiceAdapter:
             self._last_inference_ms = msg.get("inference_ms", 0.0)
             self._last_rtf = msg.get("rtf", 0.0)
         elif event == "audio_buffering":
-            pass  # Normal — model is buffering
+            self._inflight_chunks = max(0, self._inflight_chunks - 1)
         elif event == "error":
+            self._inflight_chunks = max(0, self._inflight_chunks - 1)
             logger.error("Worker error", message=msg.get("message", ""), traceback=msg.get("traceback", ""))
             self._last_error = msg.get("message", "unknown worker error")
             self._state = EngineState.ERROR
@@ -363,9 +392,17 @@ class MeanVC2VoiceAdapter:
                 missing = [k for k, v in self._cfg.check_assets().items() if not v]
                 raise RuntimeError(f"MeanVC2 assets missing: {', '.join(missing)}. Download weights first.")
 
-            # 3. Ensure worker is running
-            if not self._worker_proc:
+            # 3. Ensure worker is running (respawn if dead)
+            if not self._worker_proc or self._worker_proc.returncode is not None:
+                if self._worker_proc is not None:
+                    logger.warning("Respawning exited MeanVC2 worker", returncode=self._worker_proc.returncode)
+                    await self._kill_worker()
+                self._worker_loaded.clear()
+                self._worker_target_set.clear()
+                self._last_stderr_tail.clear()
                 await self._start_worker()
+
+            self._inflight_chunks = 0
 
             # 4. Load model if not loaded
             if not self._worker_loaded.is_set():

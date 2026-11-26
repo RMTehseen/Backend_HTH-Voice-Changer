@@ -31,9 +31,9 @@ def _default_source_dir() -> str:
 class MeanVC2Config:
     """Configuration for the MeanVC2 neural voice conversion adapter."""
     # Compute device
-    device: str = "cpu"  # "cpu" or "cuda"
+    device: str = field(default_factory=lambda: os.environ.get("HTH_MEANVC2_DEVICE", "cpu"))
     # Model variant: "40ms" (lower latency) or "120ms" (higher quality)
-    model_variant: str = "40ms"
+    model_variant: str = field(default_factory=lambda: os.environ.get("HTH_MEANVC2_VARIANT", "40ms"))
     # Model directory (overridable via HTH_MEANVC2_MODEL_DIR env var)
     model_dir: str = field(default_factory=lambda: os.environ.get("HTH_MEANVC2_MODEL_DIR", _default_model_dir()))
     # MeanVC2 source code directory

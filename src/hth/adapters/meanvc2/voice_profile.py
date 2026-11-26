@@ -11,6 +11,8 @@ from typing import Optional
 
 from hth.core.logging import get_logger
 
+from .default_references import get_reference_path as _bundled_wav
+
 logger = get_logger("hth.adapters.meanvc2.profiles")
 
 
@@ -78,9 +80,27 @@ class VoiceProfileStore:
 
         if not self._profiles and auto_seed:
             self._seed_default_profiles()
+        elif auto_seed and self._profiles:
+            # Backfill bundled WAV paths for any existing profiles that have none.
+            # This fixes profiles seeded before bundled WAVs were introduced.
+            changed = False
+            for pid, profile in self._profiles.items():
+                if not profile.reference_wav_path:
+                    wav = _bundled_wav(pid)
+                    if wav:
+                        profile.reference_wav_path = wav
+                        changed = True
+            if changed:
+                self._save_index()
+                logger.info("Backfilled bundled reference WAV paths for existing profiles")
 
     def _seed_default_profiles(self) -> None:
         """Seed pre-configured curated voice profiles if store is empty (e.g. cloud or new instance)."""
+
+        def _ref(pid: str) -> str:
+            """Return bundled WAV path for profile, or '' if not found."""
+            return _bundled_wav(pid) or ""
+
         defaults = [
             VoiceProfile(
                 profile_id="profile-female-eva",
@@ -97,6 +117,7 @@ class VoiceProfileStore:
                 consent_statement="Consented internal reference voice for HTH Real Voice Changer.",
                 language_hint="en-US",
                 description="Bright, clear, and natural female voice suitable for conversations and calls.",
+                reference_wav_path=_ref("profile-female-eva"),
             ),
             VoiceProfile(
                 profile_id="profile-female-ayesha",
@@ -113,6 +134,7 @@ class VoiceProfileStore:
                 consent_statement="Consented internal reference voice for HTH Real Voice Changer.",
                 language_hint="ur-PK / en",
                 description="Warm, natural soft female voice with smooth articulation.",
+                reference_wav_path=_ref("profile-female-ayesha"),
             ),
             VoiceProfile(
                 profile_id="profile-female-zara",
@@ -129,6 +151,7 @@ class VoiceProfileStore:
                 consent_statement="Consented internal reference voice for HTH Real Voice Changer.",
                 language_hint="en-US",
                 description="Warm, expressive female voice with rich dynamic timbre.",
+                reference_wav_path=_ref("profile-female-zara"),
             ),
             VoiceProfile(
                 profile_id="profile-male-bilal",
@@ -145,6 +168,7 @@ class VoiceProfileStore:
                 consent_statement="Consented internal reference voice for HTH Real Voice Changer.",
                 language_hint="ur-PK / en",
                 description="Deep, authoritative yet natural male timbre.",
+                reference_wav_path=_ref("profile-male-bilal"),
             ),
             VoiceProfile(
                 profile_id="profile-female-source",
@@ -161,6 +185,7 @@ class VoiceProfileStore:
                 consent_statement="Consented internal reference voice for HTH Real Voice Changer.",
                 language_hint="ja / en",
                 description="High-spirited anime character style expressive voice.",
+                reference_wav_path=_ref("profile-female-source"),
             ),
             VoiceProfile(
                 profile_id="profile-character-ratke",
@@ -177,6 +202,7 @@ class VoiceProfileStore:
                 consent_statement="Consented internal reference voice for HTH Real Voice Changer.",
                 language_hint="en",
                 description="Futuristic mechanical modulated synthetic voice.",
+                reference_wav_path=_ref("profile-character-ratke"),
             ),
             VoiceProfile(
                 profile_id="profile-female-ananya",
@@ -193,6 +219,7 @@ class VoiceProfileStore:
                 consent_statement="Consented internal natural reference voice for HTH Voice Changer.",
                 language_hint="hi-IN / ur",
                 description="Natural Indian Hindi/Urdu female accent, expressive and polite tone for live calls.",
+                reference_wav_path=_ref("profile-female-ananya"),
             ),
             VoiceProfile(
                 profile_id="profile-female-priya",
@@ -209,6 +236,7 @@ class VoiceProfileStore:
                 consent_statement="Consented internal natural reference voice for HTH Voice Changer.",
                 language_hint="hi-IN / en-IN",
                 description="Crisp Indian accent female voice with clear articulation and natural cadence.",
+                reference_wav_path=_ref("profile-female-priya"),
             ),
             VoiceProfile(
                 profile_id="profile-female-sana",
@@ -225,6 +253,7 @@ class VoiceProfileStore:
                 consent_statement="Consented internal natural reference voice for HTH Voice Changer.",
                 language_hint="ur-PK",
                 description="Soft, pleasant Pakistani Urdu female accent, authentic and friendly tone.",
+                reference_wav_path=_ref("profile-female-sana"),
             ),
             VoiceProfile(
                 profile_id="profile-female-chloe",
@@ -241,6 +270,7 @@ class VoiceProfileStore:
                 consent_statement="Consented internal natural reference voice for HTH Voice Changer.",
                 language_hint="en-US",
                 description="Melodic, gentle international female voice with bright timbre.",
+                reference_wav_path=_ref("profile-female-chloe"),
             ),
         ]
         for p in defaults:

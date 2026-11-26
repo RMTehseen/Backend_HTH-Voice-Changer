@@ -323,13 +323,20 @@ def test_telemetry_subscription_and_unsubscribe():
 
 @pytest.mark.asyncio
 async def test_attach_profile_reference_and_has_reference(tmp_path):
-    """Attaching a valid WAV updates reference path and profile_has_reference."""
+    """Attaching a valid WAV updates reference path and profile_has_reference.
+
+    Since profiles are now seeded with bundled synthetic WAVs, the first profile
+    already has a reference when the store is created.  This test verifies that
+    attach_profile_reference correctly *replaces* the reference with a new WAV
+    and that profile_has_reference reflects the updated path.
+    """
     import wave
 
     adapter = MeanVC2VoiceAdapter()
     adapter._profile_store = VoiceProfileStore(str(tmp_path / "profiles"), auto_seed=True)
     prof = adapter.list_voice_profiles()[0]
-    assert adapter.profile_has_reference(prof) is False
+    # Profiles are now seeded with bundled WAVs — has_reference is True from the start.
+    assert adapter.profile_has_reference(prof) is True
 
     wav_path = tmp_path / "sample.wav"
     sr = 16000
@@ -342,6 +349,7 @@ async def test_attach_profile_reference_and_has_reference(tmp_path):
         wf.writeframes(pcm.tobytes())
 
     updated = await adapter.attach_profile_reference(prof.profile_id, str(wav_path))
+    # Path must be updated to the newly attached WAV
     assert updated.reference_wav_path == str(wav_path)
     assert adapter.profile_has_reference(updated) is True
 

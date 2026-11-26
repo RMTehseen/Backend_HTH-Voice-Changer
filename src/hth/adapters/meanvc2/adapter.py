@@ -510,6 +510,8 @@ class MeanVC2VoiceAdapter:
                 "vocoder_path": cfg.vocoder_path,
                 "speaker_model_path": cfg.speaker_model_path,
                 "wavlm_config_path": cfg.wavlm_config_path,
+                # Pass FP16 flag explicitly so worker enables Tensor Core autocast on CUDA
+                "use_fp16": cfg.device == "cuda",
             }
         }
         await self._send_to_worker(load_msg)

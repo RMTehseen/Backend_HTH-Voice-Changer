@@ -82,8 +82,9 @@ class MeanVC2VoiceAdapter:
         self._telemetry_queues: set[asyncio.Queue[dict[str, Any]]] = set()
         self._last_telemetry_ts: float = 0.0
         self._inflight_chunks: int = 0
-        self._max_inflight_chunks: int = 3
+        self._max_inflight_chunks: int = 5
         self._last_stderr_tail: Deque[str] = collections.deque(maxlen=10)
+        self._processing_mode: str = "pure_neural"  # "pure_neural" | "hybrid" | "bypass"
         from .dsp_effects import DSPPostProcessor
         self._remote_dsp = DSPPostProcessor()
 
@@ -284,7 +285,11 @@ class MeanVC2VoiceAdapter:
         """Push a 16kHz float32 mono chunk from a remote WebSocket client directly to the worker."""
         if self._state != EngineState.RUNNING or self._is_muted:
             return
-        if self._active_profile_id in ("clean-mic", "bypass") or self._passthrough_enabled:
+        if (
+            self._processing_mode == "bypass"
+            or self._active_profile_id in ("clean-mic", "bypass")
+            or self._passthrough_enabled
+        ):
             self._frames_processed += 1
             self._emit_remote_bytes(samples.astype(np.float32).tobytes())
             return
@@ -319,7 +324,7 @@ class MeanVC2VoiceAdapter:
                 self._frames_processed += 1
                 if self._remote_audio_queues:
                     profile = self.get_active_profile()
-                    if profile and self._remote_dsp is not None:
+                    if profile and self._processing_mode == "hybrid" and self._remote_dsp is not None:
                         samples = self._remote_dsp.process(
                             samples,
                             pitch_shift=float(getattr(profile, "pitch_shift", 0.0) or 0.0),
@@ -327,6 +332,8 @@ class MeanVC2VoiceAdapter:
                             sound_effect=str(getattr(profile, "sound_effect", "none") or "none"),
                             volume_gain=float(getattr(profile, "volume_gain", 1.0) or 1.0),
                         )
+                    elif profile and profile.volume_gain is not None and float(profile.volume_gain) != 1.0:
+                        samples = np.tanh(samples * float(profile.volume_gain)).astype(np.float32)
                     self._emit_remote_bytes(samples.astype(np.float32).tobytes())
             self._last_inference_ms = msg.get("inference_ms", 0.0)
             self._last_rtf = msg.get("rtf", 0.0)
@@ -674,6 +681,17 @@ class MeanVC2VoiceAdapter:
         if "model_variant" in params:
             # Requires restart
             self._cfg.model_variant = params["model_variant"]
+        if "processing_mode" in params:
+            self.set_processing_mode(str(params["processing_mode"]))
+
+    def set_processing_mode(self, mode: str) -> str:
+        """Switch between pure_neural (Single AI), hybrid (AI + Post-DSP), and bypass."""
+        normalized = (mode or "").strip().lower()
+        if normalized not in ("pure_neural", "hybrid", "bypass"):
+            raise ValueError("mode must be 'pure_neural', 'hybrid', or 'bypass'")
+        self._processing_mode = normalized
+        logger.info("MeanVC2 processing mode updated", mode=normalized)
+        return self._processing_mode
 
     async def select_model(self, manifest: Any) -> None:
         """Switch voice profile (target speaker)."""

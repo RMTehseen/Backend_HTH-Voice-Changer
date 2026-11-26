@@ -30,6 +30,7 @@ Events (JSON):
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import sys
@@ -103,7 +104,16 @@ class MeanVC2Worker:
                 torch.set_num_interop_threads(1)
             except Exception:
                 pass
-        torch.backends.cudnn.enabled = False
+        if device == "cuda":
+            torch.backends.cudnn.enabled = True
+            torch.backends.cudnn.benchmark = True
+            if hasattr(torch, "set_float32_matmul_precision"):
+                try:
+                    torch.set_float32_matmul_precision("high")
+                except Exception:
+                    pass
+        else:
+            torch.backends.cudnn.enabled = False
 
         # Paths
         vc_ckpt = config["vc_model_path"]
@@ -170,8 +180,13 @@ class MeanVC2Worker:
         runner.vc_gtm_kv = None
         runner.variant = variant
         env_steps = os.environ.get("HTH_MEANVC2_CFM_STEPS", "").strip()
-        default_steps = int(env_steps) if env_steps.isdigit() and int(env_steps) >= 1 else (1 if device == "cpu" else 2)
+        default_steps = int(env_steps) if env_steps.isdigit() and int(env_steps) >= 1 else 1
         runner.n_steps = int(config.get("cfm_steps", default_steps))
+        runner.use_fp16 = (
+            device == "cuda"
+            and bool(config.get("use_fp16", True))
+            and os.environ.get("HTH_MEANVC2_FP16", "1") != "0"
+        )
         runner._warmed_up = False
 
         # Streaming params from upstream run_rt.py
@@ -201,6 +216,7 @@ class MeanVC2Worker:
         runner.down_linspace = torch.linspace(1, 0, steps=runner.vocoder_wav_overlap)
         runner.up_linspace = torch.linspace(0, 1, steps=runner.vocoder_wav_overlap)
         runner._min_bn_len = runner.chunk_size + runner.block_size
+        runner._req_cache_tensor = torch.tensor(runner._required_cache_size, dtype=torch.int64)
 
         self._runner = runner
         self._init_cache()
@@ -259,7 +275,12 @@ class MeanVC2Worker:
                 "message": f"Reference audio not present on server for {profile_id}; using deterministic fallback embedding. Upload a reference WAV for custom timbre.",
             })
 
-        with torch.no_grad():
+        amp_ctx = (
+            torch.amp.autocast("cuda", dtype=torch.float16)
+            if getattr(r, "use_fp16", False)
+            else contextlib.nullcontext()
+        )
+        with torch.no_grad(), amp_ctx:
             r.vc_gtm_kv = r.vc.gtm(r.vc_spk_emb)
 
         # Run actual CUDA/JIT warmup once target speaker is set
@@ -307,6 +328,9 @@ class MeanVC2Worker:
                 cache_t = r.asr_att_cache.size(2) if r.asr_att_cache.dim() > 0 else 0
                 r.asr_offset = max(cache_t, r.asr_offset - 4000)
 
+            req_cache_t = getattr(r, "_req_cache_tensor", None)
+            if req_cache_t is None:
+                req_cache_t = torch.tensor(r._required_cache_size, dtype=torch.int64)
             bns = []
             i = 0
             while i + r._bn_window <= fbanks.shape[0]:
@@ -314,7 +338,7 @@ class MeanVC2Worker:
                 out, r.asr_att_cache, r.asr_cnn_cache = r.asr(
                     fb,
                     torch.tensor(r.asr_offset, dtype=torch.int64),
-                    torch.tensor(r._required_cache_size, dtype=torch.int64),
+                    req_cache_t,
                     r.asr_att_cache, r.asr_cnn_cache,
                 )
                 bns.append(out.squeeze(0).detach())
@@ -344,7 +368,7 @@ class MeanVC2Worker:
 
         # Build BN buffer
         if r.device == "cuda":
-            bn_new = bn_new.to(r.device)
+            bn_new = bn_new.to(r.device, non_blocking=True)
 
         if r.bn_buffer is None:
             r.bn_buffer = bn_new
@@ -368,11 +392,16 @@ class MeanVC2Worker:
             cond = r.bn_buffer[:, :r._min_bn_len, :]
             r.bn_buffer = r.bn_buffer[:, r.chunk_size:, :]
 
-            # === VC step (optimized 1-step CFM on CPU cuts inference time in half) ===
+            # === VC step (1-step CFM + CUDA FP16 Tensor Core autocast) ===
             N = getattr(r, "n_steps", 1)
             dt = 1.0 / N
             inference_ctx = getattr(torch, "inference_mode", torch.no_grad)
-            with inference_ctx():
+            amp_ctx = (
+                torch.amp.autocast("cuda", dtype=torch.float16)
+                if getattr(r, "use_fp16", False)
+                else contextlib.nullcontext()
+            )
+            with inference_ctx(), amp_ctx:
                 x = torch.randn(1, cond.shape[1], 80, device=r.device, dtype=cond.dtype)
                 if r.noise_cache is not None:
                     x[:, :r.block_size, :] = r.noise_cache
@@ -401,14 +430,16 @@ class MeanVC2Worker:
                 r.vc_offset += r.chunk_size
                 mel = x[:, :r.chunk_size, :].transpose(1, 2)
 
-            # === Vocoder ===
-            with torch.no_grad():
+            # === Vocoder (TorchScript runs reliably in fp32 with cuDNN enabled) ===
+            with inference_ctx():
                 if r.vocoder_cache is not None:
-                    mel = torch.cat([r.vocoder_cache, mel], dim=-1)
+                    mel = torch.cat([r.vocoder_cache, mel.float()], dim=-1)
+                else:
+                    mel = mel.float()
                 r.vocoder_cache = mel[:, :, -r.vocoder_overlap:]
                 mel_in = (mel + 1) / 2
                 if r.device == "cuda":
-                    mel_in = mel_in.to(r.device)
+                    mel_in = mel_in.to(r.device, non_blocking=True)
                 wav = r.vocoder.decode(mel_in).squeeze().detach().cpu().numpy()
                 if r.last_wav is not None:
                     wav = wav[r.vocoder_wav_pad:]

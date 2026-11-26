@@ -205,3 +205,29 @@ async def test_get_profile_reference_audio_and_path_jail(client: AsyncClient, tm
         app.dependency_overrides.clear()
 
 
+@pytest.mark.asyncio
+async def test_set_meanvc2_processing_mode(client: AsyncClient) -> None:
+    """POST /mode switches cleanly between pure_neural, hybrid, and bypass."""
+    from hth.adapters.meanvc2.adapter import MeanVC2VoiceAdapter
+    from hth.api.routers.meanvc2 import _get_meanvc2_adapter
+
+    adapter = MeanVC2VoiceAdapter()
+    app = client._transport.app  # type: ignore[attr-defined]
+    app.dependency_overrides[_get_meanvc2_adapter] = lambda: adapter
+    try:
+        for mode in ("hybrid", "bypass", "pure_neural"):
+            resp = await client.post("/api/v1/meanvc2/mode", json={"mode": mode}, headers=_HEADERS)
+            assert resp.status_code == 200
+            assert resp.json()["processing_mode"] == mode
+
+        status_resp = await client.get("/api/v1/meanvc2/status", headers=_HEADERS)
+        assert status_resp.status_code == 200
+        assert status_resp.json()["processing_mode"] == "pure_neural"
+
+        bad_resp = await client.post("/api/v1/meanvc2/mode", json={"mode": "invalid"}, headers=_HEADERS)
+        assert bad_resp.status_code == 400
+    finally:
+        app.dependency_overrides.clear()
+
+
+

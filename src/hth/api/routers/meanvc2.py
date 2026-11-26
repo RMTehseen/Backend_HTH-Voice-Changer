@@ -99,6 +99,10 @@ class ModelVariantRequest(BaseModel):
     variant: str  # "40ms" or "120ms"
 
 
+class ModeSwitchRequest(BaseModel):
+    mode: str  # "pure_neural" | "hybrid" | "bypass"
+
+
 def _detect_cpu_name() -> str:
     """Detect host CPU model name cleanly across Windows and Linux/Colab."""
     import platform
@@ -154,6 +158,7 @@ async def get_meanvc2_status(adapter: Any = Depends(_get_meanvc2_adapter)) -> di
         "profiles": profiles,
         "active_profile_id": getattr(adapter, "_active_profile_id", None),
         "model_variant": adapter._cfg.model_variant,
+        "processing_mode": getattr(adapter, "_processing_mode", "pure_neural"),
         "worker_running": bool(worker_proc and worker_proc.returncode is None),
         "worker_loaded": bool(worker_loaded and worker_loaded.is_set()),
         "target_set": bool(target_set and target_set.is_set()),
@@ -548,6 +553,19 @@ async def set_model_variant(req: ModelVariantRequest, adapter: Any = Depends(_ge
             else f"Switched to {req.variant}. Ready to start conversion."
         ),
     }
+
+
+@router.post("/mode")
+async def set_processing_mode(
+    req: ModeSwitchRequest,
+    adapter: Any = Depends(_get_meanvc2_adapter),
+) -> dict[str, Any]:
+    """Switch active MeanVC2 processing mode: pure_neural (single AI), hybrid (AI + Post-DSP), or bypass."""
+    try:
+        mode = adapter.set_processing_mode(req.mode)
+        return {"processing_mode": mode}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 _MAX_AUDIO_WS_FRAME_BYTES = 262144  # 256 KB guard per binary PCM chunk

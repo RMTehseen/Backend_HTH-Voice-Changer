@@ -346,5 +346,27 @@ async def test_attach_profile_reference_and_has_reference(tmp_path):
     assert adapter.profile_has_reference(updated) is True
 
 
+@pytest.mark.asyncio
+async def test_processing_mode_switch_and_bypass_passthrough():
+    """Processing mode validates options and routes bypass cleanly without worker inference."""
+    adapter = MeanVC2VoiceAdapter()
+    assert adapter._processing_mode == "pure_neural"
+    assert adapter.set_processing_mode("hybrid") == "hybrid"
+    assert adapter.set_processing_mode("bypass") == "bypass"
+
+    q = adapter.subscribe_audio_out()
+    adapter._state = EngineState.RUNNING
+    adapter._active_profile_id = "profile-female-eva"
+    samples = np.ones(160, dtype=np.float32) * 0.125
+    await adapter.push_remote_audio(samples)
+    out = q.get_nowait()
+    assert len(out) == 160 * 4
+    adapter.unsubscribe_audio_out(q)
+
+    with pytest.raises(ValueError):
+        adapter.set_processing_mode("unsupported")
+
+
+
 
 

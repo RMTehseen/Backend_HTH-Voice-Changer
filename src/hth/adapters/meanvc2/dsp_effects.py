@@ -80,14 +80,14 @@ class DSPPostProcessor:
             mask = weight > 1e-4
             out[mask] = resampled[mask] / weight[mask]
 
-        # 2. Timbre / Formant Tilt Filter
+        # 2. Timbre / Formant Tilt Filter (vectorized, zero-loop)
         if abs(timbre_ratio - 1.0) >= 0.02:
             alpha = float(np.clip((timbre_ratio - 1.0) * 0.6, -0.65, 0.65))
-            prev = 0.0
-            for i in range(n_samples):
-                val = out[i]
-                out[i] = val - alpha * prev
-                prev = val
+            shifted = self._delay_buf if n_samples == self.chunk_size else np.empty_like(out)
+            shifted[0] = 0.0
+            if n_samples > 1:
+                shifted[1:] = out[:-1]
+            out -= alpha * shifted
 
         # 3. Sound Effect Presets
         if sound_effect == "room":

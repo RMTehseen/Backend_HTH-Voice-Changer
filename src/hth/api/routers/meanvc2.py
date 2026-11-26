@@ -480,7 +480,10 @@ async def websocket_audio_stream(
     sender_task = asyncio.create_task(_send_loop())
     try:
         while True:
-            data = await websocket.receive_bytes()
+            msg = await websocket.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+            data = msg.get("bytes")
             if not data or len(data) > _MAX_AUDIO_WS_FRAME_BYTES or (len(data) % 4) != 0:
                 continue
             if adapter._state == EngineState.ERROR:

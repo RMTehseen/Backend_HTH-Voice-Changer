@@ -79,9 +79,10 @@ class VoiceProfileStore:
         if not self._profiles and auto_seed:
             self._seed_default_profiles()
         elif auto_seed and self._profiles:
-            # Attach real reference WAVs from local references/ folder if present on disk
+            # Merge any newly added curated profiles without overwriting user edits,
+            # and attach real reference WAVs from local references/ folder if present.
             refs_dir = self.profile_dir / "references"
-            changed = False
+            changed = self._merge_missing_curated_profiles()
             if refs_dir.is_dir():
                 for pid, profile in self._profiles.items():
                     if not profile.reference_wav_path:
@@ -91,10 +92,10 @@ class VoiceProfileStore:
                             changed = True
             if changed:
                 self._save_index()
-                logger.info("Linked local reference WAVs for existing profiles")
+                logger.info("Updated voice profile index with curated profiles/references")
 
-    def _seed_default_profiles(self) -> None:
-        """Seed pre-configured curated voice profiles if store is empty (e.g. cloud or new instance)."""
+    def _build_default_profiles(self) -> list[VoiceProfile]:
+        """Return the curated list of default HTH voice profiles."""
 
         def _ref(pid: str) -> str:
             """Return real reference WAV from profile_dir/references if present on disk, else ''."""
@@ -106,7 +107,7 @@ class VoiceProfileStore:
         # timbre_ratio=1.0: no formant stretch beyond the model output.
         # volume_gain=1.0: no gain (tanh distortion was caused by values >1.0).
         # sound_effect="none": no reverb/room/telephone — those make voice sound processed.
-        defaults = [
+        return [
             VoiceProfile(
                 profile_id="profile-female-eva",
                 display_name="Eva",
@@ -277,11 +278,109 @@ class VoiceProfileStore:
                 description="Melodic, gentle international female voice with bright timbre.",
                 reference_wav_path=_ref("profile-female-chloe"),
             ),
+            VoiceProfile(
+                profile_id="profile-female-zoya",
+                display_name="Zoya (Urdu)",
+                avatar_id="female_zoya",
+                category="Female",
+                badge="URDU",
+                pitch_shift=0.0,
+                timbre_ratio=1.0,
+                volume_gain=1.0,
+                sound_effect="none",
+                favorite=True,
+                consent_declared=True,
+                consent_statement="Consented internal natural reference voice for HTH Voice Changer.",
+                language_hint="ur-PK / hi",
+                description="Warm, natural Pakistani Urdu/Hindi female voice ideal for live family & call conversations.",
+                reference_wav_path=_ref("profile-female-zoya"),
+            ),
+            VoiceProfile(
+                profile_id="profile-female-mehwish",
+                display_name="Mehwish",
+                avatar_id="female_mehwish",
+                category="Female",
+                badge="URDU",
+                pitch_shift=0.0,
+                timbre_ratio=1.0,
+                volume_gain=1.0,
+                sound_effect="none",
+                favorite=True,
+                consent_declared=True,
+                consent_statement="Consented internal natural reference voice for HTH Voice Changer.",
+                language_hint="ur-PK",
+                description="Soft, polite Pakistani Karachi Urdu female tone with clear natural flow.",
+                reference_wav_path=_ref("profile-female-mehwish"),
+            ),
+            VoiceProfile(
+                profile_id="profile-female-kavya",
+                display_name="Kavya",
+                avatar_id="female_kavya",
+                category="Female",
+                badge="HINDI",
+                pitch_shift=0.0,
+                timbre_ratio=1.0,
+                volume_gain=1.0,
+                sound_effect="none",
+                favorite=True,
+                consent_declared=True,
+                consent_statement="Consented internal natural reference voice for HTH Voice Changer.",
+                language_hint="hi-IN / ur",
+                description="Expressive Indian Hindi/Urdu female voice with crisp conversational clarity.",
+                reference_wav_path=_ref("profile-female-kavya"),
+            ),
+            VoiceProfile(
+                profile_id="profile-female-neha",
+                display_name="Neha (Desi)",
+                avatar_id="female_neha",
+                category="Female",
+                badge="DESI",
+                pitch_shift=0.0,
+                timbre_ratio=1.0,
+                volume_gain=1.0,
+                sound_effect="none",
+                favorite=False,
+                consent_declared=True,
+                consent_statement="Consented internal natural reference voice for HTH Voice Changer.",
+                language_hint="hi-IN / ur-PK",
+                description="Lively South Asian Indian/Pakistani female voice tailored for everyday calls.",
+                reference_wav_path=_ref("profile-female-neha"),
+            ),
+            VoiceProfile(
+                profile_id="profile-male-hamza",
+                display_name="Hamza",
+                avatar_id="male_hamza",
+                category="Male",
+                badge="URDU",
+                pitch_shift=0.0,
+                timbre_ratio=1.0,
+                volume_gain=1.0,
+                sound_effect="none",
+                favorite=False,
+                consent_declared=True,
+                consent_statement="Consented internal natural reference voice for HTH Voice Changer.",
+                language_hint="ur-PK / hi",
+                description="Natural, grounded Pakistani/Indian Urdu male voice for realistic real-time speech.",
+                reference_wav_path=_ref("profile-male-hamza"),
+            ),
         ]
+
+    def _merge_missing_curated_profiles(self) -> bool:
+        """Add any newly curated profiles missing from an existing index."""
+        changed = False
+        for p in self._build_default_profiles():
+            if p.profile_id not in self._profiles:
+                self._profiles[p.profile_id] = p
+                changed = True
+        return changed
+
+    def _seed_default_profiles(self) -> None:
+        """Seed pre-configured curated voice profiles if store is empty (e.g. cloud or new instance)."""
+        defaults = self._build_default_profiles()
         for p in defaults:
             self._profiles[p.profile_id] = p
         self._save_index()
-        logger.info("Seeded 10 default voice profiles into store", count=len(defaults))
+        logger.info("Seeded curated voice profiles into store", count=len(defaults))
 
     def _save_index(self) -> None:
         tmp = self._index_path.with_suffix(".tmp")

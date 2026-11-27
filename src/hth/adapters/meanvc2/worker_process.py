@@ -96,7 +96,11 @@ class MeanVC2Worker:
         else:
             device = "cpu"
 
-        default_threads = min(4, max(1, os.cpu_count() or 2))
+        try:
+            avail_cpus = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            avail_cpus = os.cpu_count() or 2
+        default_threads = min(4, max(1, avail_cpus))
         num_threads = int(config.get("num_threads", default_threads))
         torch.set_num_threads(num_threads)
         if hasattr(torch, "set_num_interop_threads"):
@@ -180,8 +184,7 @@ class MeanVC2Worker:
         runner.vc_gtm_kv = None
         runner.variant = variant
         env_steps = os.environ.get("HTH_MEANVC2_CFM_STEPS", "").strip()
-        cuda_default = 2 if device == "cuda" else 1
-        default_steps = int(env_steps) if env_steps.isdigit() and int(env_steps) >= 1 else cuda_default
+        default_steps = int(env_steps) if env_steps.isdigit() and int(env_steps) >= 1 else 1
         runner.n_steps = int(config.get("cfm_steps", default_steps))
         runner.use_fp16 = (
             device == "cuda"
@@ -356,8 +359,12 @@ class MeanVC2Worker:
                 bn = torch.cat([r.encoder_output_cache, bn], dim=1)
             r.encoder_output_cache = bn[:, -1:, :]
 
-            vc_chunk = 16
+            # Scale interpolated mel frames cleanly to actual ASR output count
+            # (40ms model: 1 ASR interval = 80ms = 8 mel frames; 120ms model: 16 mel frames).
+            # Supports both 80ms (1280 samples) and 160ms (2560 samples) mic chunks with 1:1 timing.
+            frames_per_asr_step = 16 if getattr(r, "variant", "40ms") == "120ms" else 8
             if bn.shape[1] >= 2:
+                vc_chunk = frames_per_asr_step * (bn.shape[1] - 1)
                 bn_up = bn.transpose(1, 2)
                 bn_up = F.interpolate(bn_up, size=vc_chunk + 1,
                                       mode='linear', align_corners=True)
@@ -376,8 +383,8 @@ class MeanVC2Worker:
         else:
             r.bn_buffer = torch.cat([r.bn_buffer, bn_new], dim=1)
 
-        # Cap BN buffer to avoid memory buildup if input outpaces inference
-        MAX_BN_FRAMES = 64
+        # Cap BN buffer generously to absorb internet burst packets without eating words
+        MAX_BN_FRAMES = 128
         if r.bn_buffer.shape[1] > MAX_BN_FRAMES:
             r.bn_buffer = r.bn_buffer[:, -MAX_BN_FRAMES:, :]
 
@@ -386,7 +393,7 @@ class MeanVC2Worker:
 
         # VC + Vocoder
         wav_parts = []
-        max_steps = 4
+        max_steps = 8
         for _ in range(max_steps):
             if r.bn_buffer.shape[1] < r._min_bn_len:
                 break

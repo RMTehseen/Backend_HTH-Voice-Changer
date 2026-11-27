@@ -32,7 +32,7 @@ import numpy as np
 try:
     import sounddevice as sd
     HAS_SOUNDDEVICE = True
-except ImportError:
+except (ImportError, OSError):
     sd = None
     HAS_SOUNDDEVICE = False
 

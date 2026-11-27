@@ -100,7 +100,7 @@ class MeanVC2Worker:
             avail_cpus = len(os.sched_getaffinity(0))
         except (AttributeError, OSError):
             avail_cpus = os.cpu_count() or 2
-        default_threads = min(4, max(1, avail_cpus))
+        default_threads = min(2, max(1, avail_cpus))
         num_threads = int(config.get("num_threads", default_threads))
         torch.set_num_threads(num_threads)
         if hasattr(torch, "set_num_interop_threads"):
@@ -110,7 +110,8 @@ class MeanVC2Worker:
                 pass
         if device == "cuda":
             torch.backends.cudnn.enabled = True
-            torch.backends.cudnn.benchmark = True
+            # Never benchmark variable streaming mel lengths (prevents mid-speech GPU stalls)
+            torch.backends.cudnn.benchmark = False
             if hasattr(torch, "set_float32_matmul_precision"):
                 try:
                     torch.set_float32_matmul_precision("high")
@@ -127,14 +128,53 @@ class MeanVC2Worker:
         spk_model_path = config["speaker_model_path"]
         wavlm_cfg_path = config.get("wavlm_config_path", "")
 
-        # ASR (TorchScript traced model must stay on CPU — matches upstream run_rt.py)
+        # Streaming params from upstream run_rt.py
+        if variant == "120ms":
+            chunk_size = 12
+            bn_window = 19
+            bn_stride = 16
+            required_cache_size = 8
+            asr_offset_init = 8
+            asr_offset_step = 4
+        else:
+            chunk_size = 4
+            bn_window = 11
+            bn_stride = 8
+            required_cache_size = 4
+            asr_offset_init = 4
+            asr_offset_step = 2
+
+        # ASR: Try loading Fast-U2++ JIT onto CUDA GPU (eliminates ~60-80ms Colab CPU bottleneck),
+        # with automatic fail-safe fallback to CPU if TorchScript graph contains CPU-only ops.
         _emit({"event": "progress", "step": "loading_asr"})
-        asr = torch.jit.load(asr_ckpt, map_location="cpu")
-        asr.eval()
-        try:
-            asr = torch.jit.optimize_for_inference(asr)
-        except Exception:
-            pass
+        asr_device = "cpu"
+        asr_scalar_device = "cpu"
+        asr = None
+        if device == "cuda" and os.environ.get("HTH_MEANVC2_ASR_CUDA", "1") != "0":
+            for scalar_dev in ("cuda", "cpu"):
+                try:
+                    asr_cand = torch.jit.load(asr_ckpt, map_location="cuda")
+                    asr_cand.eval()
+                    t_fb = torch.zeros(1, bn_window, 80, device="cuda")
+                    t_off = torch.tensor(asr_offset_init, dtype=torch.int64, device=scalar_dev)
+                    t_req = torch.tensor(required_cache_size, dtype=torch.int64, device=scalar_dev)
+                    t_att = torch.zeros(6, 4, required_cache_size, 128, device="cuda")
+                    t_cnn = torch.zeros(6, 1, 256, 8, device="cuda")
+                    with torch.inference_mode():
+                        _ = asr_cand(t_fb, t_off, t_req, t_att, t_cnn)
+                    asr = asr_cand
+                    asr_device = "cuda"
+                    asr_scalar_device = scalar_dev
+                    break
+                except Exception:
+                    asr = None
+        if asr is None:
+            asr = torch.jit.load(asr_ckpt, map_location="cpu")
+            asr.eval()
+            try:
+                asr = torch.jit.optimize_for_inference(asr)
+            except Exception:
+                pass
 
         # VC model
         _emit({"event": "progress", "step": "loading_vc"})
@@ -180,6 +220,8 @@ class MeanVC2Worker:
 
         runner = _Runner()
         runner.device = device
+        runner.asr_device = asr_device
+        runner.asr_scalar_device = asr_scalar_device
         runner.asr = asr
         runner.vc = model
         runner.vocoder = vocoder
@@ -188,8 +230,22 @@ class MeanVC2Worker:
         runner.vc_gtm_kv = None
         runner.variant = variant
         env_steps = os.environ.get("HTH_MEANVC2_CFM_STEPS", "").strip()
+        # MeanVC2 is native 1-step MeanFlow ODE (lowest GPU latency; override via HTH_MEANVC2_CFM_STEPS=2)
         default_steps = int(env_steps) if env_steps.isdigit() and int(env_steps) >= 1 else 1
         runner.n_steps = int(config.get("cfm_steps", default_steps))
+        dt_val = 1.0 / max(1, runner.n_steps)
+        runner._tr_pairs = [
+            (
+                torch.full((1,), 1.0 - idx * dt_val, device=device),
+                torch.full((1,), max(0.0, 1.0 - (idx + 1) * dt_val), device=device),
+            )
+            for idx in range(runner.n_steps)
+        ]
+        try:
+            import torchaudio.compliance.kaldi as kaldi
+            runner._kaldi = kaldi
+        except Exception:
+            runner._kaldi = None
         runner.use_fp16 = (
             device == "cuda"
             and bool(config.get("use_fp16", True))
@@ -197,24 +253,15 @@ class MeanVC2Worker:
         )
         runner._warmed_up = False
 
-        # Streaming params from upstream run_rt.py
-        if variant == "120ms":
-            runner.chunk_size = 12
-            runner._bn_window = 19
-            runner._bn_stride = 16
-            runner._required_cache_size = 8
-            runner._asr_offset_init = 8
-            runner._asr_offset_step = 4
-        else:
-            runner.chunk_size = 4
-            runner._bn_window = 11
-            runner._bn_stride = 8
-            runner._required_cache_size = 4
-            runner._asr_offset_init = 4
-            runner._asr_offset_step = 2
+        runner.chunk_size = chunk_size
+        runner._bn_window = bn_window
+        runner._bn_stride = bn_stride
+        runner._required_cache_size = required_cache_size
+        runner._asr_offset_init = asr_offset_init
+        runner._asr_offset_step = asr_offset_step
 
         runner.block_size = 4
-        runner.CHUNK = 2560
+        runner.CHUNK = 2560 if variant == "120ms" else 1280
 
         # Vocoder overlap params
         runner.vocoder_overlap = 2
@@ -224,30 +271,39 @@ class MeanVC2Worker:
         runner.down_linspace = torch.linspace(1, 0, steps=runner.vocoder_wav_overlap)
         runner.up_linspace = torch.linspace(0, 1, steps=runner.vocoder_wav_overlap)
         runner._min_bn_len = runner.chunk_size + runner.block_size
-        runner._req_cache_tensor = torch.tensor(runner._required_cache_size, dtype=torch.int64)
+        runner._req_cache_tensor = torch.tensor(
+            runner._required_cache_size, dtype=torch.int64, device=asr_scalar_device
+        )
 
         self._runner = runner
         self._init_cache()
         self._extract_embedding = extract_embedding
 
-        _emit({"event": "loaded", "variant": variant, "device": device, "cuda_available": torch.cuda.is_available()})
+        _emit({
+            "event": "loaded",
+            "variant": variant,
+            "device": device,
+            "asr_device": asr_device,
+            "cuda_available": torch.cuda.is_available(),
+        })
 
     def _init_cache(self):
         import torch
         r = self._runner
+        asr_dev = getattr(r, "asr_device", "cpu")
         r.samples_cache = np.zeros(0, dtype=np.float32)
         r.frame_cache = None
         r.encoder_output_cache = None
         r.asr_offset = r._asr_offset_init
-        # ASR stays on CPU so its caches must remain CPU tensors
-        r.asr_att_cache = torch.zeros(6, 4, r._required_cache_size, 128)
-        r.asr_cnn_cache = torch.zeros(6, 1, 256, 8)
+        r.asr_att_cache = torch.zeros(6, 4, r._required_cache_size, 128, device=asr_dev)
+        r.asr_cnn_cache = torch.zeros(6, 1, 256, 8, device=asr_dev)
         r.vc_kv_cache = None
         r.vc_offset = 0
         r.noise_cache = None
         r.vocoder_cache = None
         r.last_wav = None
         r.bn_buffer = None
+        r._silent_streak = 0
 
     def set_target(self, wav_path: str, profile_id: str, embedding_path: str = "") -> None:
         global torch, F
@@ -294,7 +350,7 @@ class MeanVC2Worker:
         # Run actual CUDA/JIT warmup once target speaker is set
         if not getattr(r, "_warmed_up", False):
             dummy = np.zeros(r.CHUNK, dtype=np.float32)
-            for _ in range(2):
+            for _ in range(3):
                 self.process_chunk(dummy)
             r._warmed_up = True
 
@@ -321,7 +377,10 @@ class MeanVC2Worker:
 
             wav_scaled = padded * (1 << 15)
             wav_t = torch.from_numpy(wav_scaled).unsqueeze(0)
-            import torchaudio.compliance.kaldi as kaldi
+            kaldi = getattr(r, "_kaldi", None)
+            if kaldi is None:
+                import torchaudio.compliance.kaldi as kaldi
+                r._kaldi = kaldi
             fbanks = kaldi.fbank(wav_t, frame_length=25, frame_shift=10,
                                  snip_edges=True, num_mel_bins=80,
                                  energy_floor=0.0, dither=0.0,
@@ -329,28 +388,42 @@ class MeanVC2Worker:
 
             r.samples_cache = padded[160 * fbanks.shape[0]:]
 
-            chunk_silent = bool(float(np.sqrt(np.mean(samples * samples))) < 0.005)
-            if r.frame_cache is not None:
-                fbanks = torch.cat([r.frame_cache, fbanks], dim=0)
+            rms_val = float(np.sqrt(np.mean(samples * samples)))
+            chunk_silent = bool(rms_val < 0.006)
+            r._silent_streak = (getattr(r, "_silent_streak", 0) + 1) if chunk_silent else 0
 
-            if r.asr_offset >= 2000 and chunk_silent:
-                # Reset ASR offset during quiet pauses so long 15-60 min calls never wrap mid-word.
-                cache_t = r.asr_att_cache.size(2) if r.asr_att_cache.dim() > 0 else 0
-                r.asr_offset = cache_t
-            elif r.asr_offset >= 4000:
+            # Cleanly reset ASR + VC caches together during >=320ms natural pauses after ~40-64s
+            # so RoPE positional offsets never desynchronize from cached attention states.
+            # Keep frame_cache and encoder_output_cache (already silent) so next speech chunk stays aligned.
+            asr_dev = getattr(r, "asr_device", "cpu")
+            asr_sdev = getattr(r, "asr_scalar_device", "cpu")
+            pause_chunks = 4 if len(samples) <= 1600 else 2
+            if r._silent_streak >= pause_chunks and (r.asr_offset >= 2000 or r.vc_offset >= 1600):
+                r.asr_offset = r._asr_offset_init
+                r.asr_att_cache.zero_()
+                r.asr_cnn_cache.zero_()
+                r.vc_offset = 0
+                r.vc_kv_cache = None
+                r._silent_streak = 0
+            elif r.asr_offset >= 8000:
                 cache_t = r.asr_att_cache.size(2) if r.asr_att_cache.dim() > 0 else 0
                 r.asr_offset = max(cache_t, r.asr_offset - 4000)
 
+            if asr_dev != "cpu":
+                fbanks = fbanks.to(asr_dev, non_blocking=True)
+            if r.frame_cache is not None:
+                fbanks = torch.cat([r.frame_cache, fbanks], dim=0)
+
             req_cache_t = getattr(r, "_req_cache_tensor", None)
             if req_cache_t is None:
-                req_cache_t = torch.tensor(r._required_cache_size, dtype=torch.int64)
+                req_cache_t = torch.tensor(r._required_cache_size, dtype=torch.int64, device=asr_sdev)
             bns = []
             i = 0
             while i + r._bn_window <= fbanks.shape[0]:
                 fb = fbanks[i:i + r._bn_window].unsqueeze(0)
                 out, r.asr_att_cache, r.asr_cnn_cache = r.asr(
                     fb,
-                    torch.tensor(r.asr_offset, dtype=torch.int64),
+                    torch.tensor(r.asr_offset, dtype=torch.int64, device=asr_sdev),
                     req_cache_t,
                     r.asr_att_cache, r.asr_cnn_cache,
                 )
@@ -383,7 +456,7 @@ class MeanVC2Worker:
             bn_new = bn_up
 
         # Build BN buffer
-        if r.device == "cuda":
+        if asr_dev != r.device and r.device == "cuda":
             bn_new = bn_new.to(r.device, non_blocking=True)
 
         if r.bn_buffer is None:
@@ -391,8 +464,8 @@ class MeanVC2Worker:
         else:
             r.bn_buffer = torch.cat([r.bn_buffer, bn_new], dim=1)
 
-        # Bound BN buffer to 64 frames (640ms) for 160ms chunks so fluent phrases stay intact
-        MAX_BN_FRAMES = 64
+        # Bound BN buffer to 48 frames (480ms) for 80ms chunks so latency stays ultra-low
+        MAX_BN_FRAMES = 48
         if r.bn_buffer.shape[1] > MAX_BN_FRAMES:
             r.bn_buffer = r.bn_buffer[:, -MAX_BN_FRAMES:, :]
 
@@ -423,18 +496,22 @@ class MeanVC2Worker:
                     x[:, :r.block_size, :] = r.noise_cache
                 r.noise_cache = x[:, -r.block_size:, :].clone()
 
-                if (r.vc_offset >= 1600 and chunk_silent) or r.vc_offset >= 4000:
-                    # Reset DiT KV cache on silent pauses after ~16s so 15-60 min sessions
-                    # never hit the 40s hard cap mid-sentence.
+                if (r.vc_offset >= 1600 and getattr(r, "_silent_streak", 0) >= pause_chunks) or r.vc_offset >= 8000:
+                    # Reset DiT KV cache cleanly during pauses (or at 320s fallback) so 1-10h sessions
+                    # never stall or wrap mid-word.
                     r.vc_offset = 0
                     r.vc_kv_cache = None
 
                 pre_kv = r.vc_kv_cache
+                tr_pairs = getattr(r, "_tr_pairs", None)
                 for i in range(N):
-                    t_val = 1.0 - i * dt
-                    r_val = max(0.0, t_val - dt)
-                    t_tensor = torch.full((1,), t_val, device=r.device)
-                    r_tensor = torch.full((1,), r_val, device=r.device)
+                    if tr_pairs is not None and i < len(tr_pairs):
+                        t_tensor, r_tensor = tr_pairs[i]
+                    else:
+                        t_val = 1.0 - i * dt
+                        r_val = max(0.0, t_val - dt)
+                        t_tensor = torch.full((1,), t_val, device=r.device)
+                        r_tensor = torch.full((1,), r_val, device=r.device)
                     u, tmp_kv = r.vc(
                         x, t_tensor, r_tensor,
                         cache=None, cond=cond, spks=r.vc_spk_emb,

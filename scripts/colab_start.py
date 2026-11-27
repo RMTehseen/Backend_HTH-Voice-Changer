@@ -67,22 +67,45 @@ def _reset_stale_cloud_profiles() -> None:
     try:
         with open(profiles_json, encoding="utf-8") as f:
             data = json.load(f)
+        from hth.adapters.meanvc2.voice_profile import VoiceProfileStore
+        curated_by_id = {
+            p.profile_id: p
+            for p in VoiceProfileStore(str(profile_dir), auto_seed=False)._build_default_profiles()
+        }
         changed = False
         for pid, pdata in data.items():
             ref = pdata.get("reference_wav_path", "")
-            # Remove stale synthetic oscillator WAV references so real human WAVs sync cleanly
-            if ref and ("default_references" in ref or (Path(ref).is_file() and Path(ref).stat().st_size in (128044, 160044))):
+            dur = float(pdata.get("reference_duration_s") or 0.0)
+            # Remove stale synthetic oscillator / ultra-short (< 5s) WAV references so natural human WAVs sync cleanly
+            is_short_synth = (0.0 < dur < 5.0) or (
+                ref and Path(ref).is_file() and Path(ref).stat().st_size in (128044, 160044, 288044)
+            )
+            if ref and ("default_references" in ref or is_short_synth):
                 pdata["reference_wav_path"] = ""
+                pdata["reference_duration_s"] = 0.0
                 emb = profile_dir / f"emb_{pid}.pt"
                 if emb.is_file():
                     emb.unlink()
                 changed = True
-            # Reset seeded post-DSP effects so pure neural conversion stays clean & uncorrupted
+            # Reset legacy room/telephone/radio FX, and upgrade flat untouched profiles to calibrated age/vocal presets
             if pdata.get("sound_effect") in ("room", "telephone", "radio"):
                 pdata["pitch_shift"] = 0.0
                 pdata["timbre_ratio"] = 1.0
                 pdata["volume_gain"] = 1.0
                 pdata["sound_effect"] = "none"
+                changed = True
+            curated = curated_by_id.get(pid)
+            if (
+                curated is not None
+                and float(pdata.get("pitch_shift", 0.0)) == 0.0
+                and float(pdata.get("timbre_ratio", 1.0)) == 1.0
+                and pdata.get("sound_effect", "none") == "none"
+                and (curated.pitch_shift != 0.0 or curated.timbre_ratio != 1.0)
+            ):
+                pdata["pitch_shift"] = curated.pitch_shift
+                pdata["timbre_ratio"] = curated.timbre_ratio
+                pdata["badge"] = curated.badge
+                pdata["description"] = curated.description
                 changed = True
         if changed:
             tmp = profiles_json.with_suffix(".tmp")
@@ -222,6 +245,23 @@ def start_tunnel_and_server():
     existing_pythonpath = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{src_dir}:{project_root}:{existing_pythonpath}"
 
+    stop_keepalive = False
+
+    if tunnel_url:
+        import threading
+
+        def _tunnel_keepalive_loop():
+            while not stop_keepalive:
+                time.sleep(45)
+                if stop_keepalive:
+                    break
+                try:
+                    urllib.request.urlopen(f"{tunnel_url}/health", timeout=8).read()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_tunnel_keepalive_loop, daemon=True).start()
+
     try:
         subprocess.run([
             sys.executable, "-u", "-m", "uvicorn",
@@ -232,6 +272,7 @@ def start_tunnel_and_server():
             "--app-dir", src_dir,
         ], env=env)
     finally:
+        stop_keepalive = True
         tunnel_proc.terminate()
         log_file.close()
 

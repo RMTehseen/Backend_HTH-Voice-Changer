@@ -348,9 +348,10 @@ async def test_attach_profile_reference_and_has_reference(tmp_path):
 
 @pytest.mark.asyncio
 async def test_processing_mode_switch_and_bypass_passthrough():
-    """Processing mode validates options and routes bypass cleanly without worker inference."""
+    """Processing mode defaults to hybrid (calibrated age/vocal shaping) and routes bypass cleanly."""
     adapter = MeanVC2VoiceAdapter()
-    assert adapter._processing_mode == "pure_neural"
+    assert adapter._processing_mode == "hybrid"
+    assert adapter.set_processing_mode("pure_neural") == "pure_neural"
     assert adapter.set_processing_mode("hybrid") == "hybrid"
     assert adapter.set_processing_mode("bypass") == "bypass"
 
@@ -365,6 +366,240 @@ async def test_processing_mode_switch_and_bypass_passthrough():
 
     with pytest.raises(ValueError):
         adapter.set_processing_mode("unsupported")
+
+
+@pytest.mark.asyncio
+async def test_idle_profile_switch_clears_applied_target_and_wsola_continuity(tmp_path):
+    """Switching voice profile while IDLE invalidates cached worker target; WSOLA preserves energy."""
+    from hth.adapters.meanvc2.dsp_effects import DSPPostProcessor
+
+    adapter = MeanVC2VoiceAdapter()
+    adapter._profile_store = VoiceProfileStore(str(tmp_path / "profiles"), auto_seed=True)
+    adapter._worker_target_set.set()
+    adapter._applied_profile_id = "profile-female-eva"
+
+    await adapter.select_voice_profile("profile-male-hamza")
+    assert adapter._active_profile_id == "profile-male-hamza"
+    assert adapter._applied_profile_id is None
+    assert not adapter._worker_target_set.is_set()
+
+    # Curated profiles should have distinct vocal age/pitch calibrations
+    zoya = adapter._profile_store.get("profile-female-zoya")
+    eva = adapter._profile_store.get("profile-female-eva")
+    hamza = adapter._profile_store.get("profile-male-hamza")
+    bilal = adapter._profile_store.get("profile-male-bilal")
+    assert zoya and eva and hamza and bilal
+    assert zoya.pitch_shift > eva.pitch_shift
+    assert hamza.pitch_shift > bilal.pitch_shift
+
+    # Verify WSOLA pitch shift continuity across consecutive 80ms (1280) and 160ms (2560) chunks
+    for csize in (1280, 2560):
+        dsp = DSPPostProcessor(sample_rate=16000, chunk_size=csize)
+        t_all = np.arange(csize * 3, dtype=np.float32) / 16000.0
+        sig = 0.4 * np.sin(2 * np.pi * 200.0 * t_all)
+        out_chunks = [
+            dsp.process(sig[i * csize : (i + 1) * csize], pitch_shift=3.0, timbre_ratio=1.08)
+            for i in range(3)
+        ]
+        joined = np.concatenate(out_chunks)
+        b_idx = csize * 2
+        rms_local = float(np.sqrt(np.mean(joined[b_idx - 50 : b_idx + 50] ** 2)))
+        assert rms_local > 0.20
+        assert abs(float(joined[b_idx] - joined[b_idx - 1])) / rms_local < 0.08
+
+
+def test_long_soak_config_and_silent_cache_reset(monkeypatch):
+    """Verify generous watchdog/backpressure limits and synchronized silent cache reset."""
+    import sys
+    import types
+    from hth.adapters.meanvc2.worker_process import MeanVC2Worker
+
+    cfg = MeanVC2Config()
+    assert cfg.heartbeat_timeout_s >= 25.0
+    adapter = MeanVC2VoiceAdapter(cfg)
+    assert adapter._max_inflight_chunks >= 12
+
+    # Build minimal torch + kaldi stubs so worker_process silence reset runs in isolated Python 3.13 venv
+    class _FakeTensor:
+        def __init__(self, data: np.ndarray):
+            self.data = np.asarray(data, dtype=np.float32)
+            self.shape = self.data.shape
+            self.dtype = "float32"
+
+        def dim(self):
+            return self.data.ndim
+
+        def size(self, axis: int):
+            return self.data.shape[axis]
+
+        def unsqueeze(self, axis: int):
+            return _FakeTensor(np.expand_dims(self.data, axis))
+
+        def squeeze(self, axis: int | None = None):
+            return _FakeTensor(np.squeeze(self.data, axis=axis))
+
+        def transpose(self, d0: int, d1: int):
+            return _FakeTensor(np.swapaxes(self.data, d0, d1))
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.data
+
+        def float(self):
+            return self
+
+        def to(self, *args, **kwargs):
+            return self
+
+        def zero_(self):
+            self.data.fill(0.0)
+            return self
+
+        def fill_(self, val: float):
+            self.data.fill(val)
+            return self
+
+        def clone(self):
+            return _FakeTensor(self.data.copy())
+
+        def __getitem__(self, item):
+            return _FakeTensor(self.data[item])
+
+        def __setitem__(self, item, val):
+            self.data[item] = val.data if isinstance(val, _FakeTensor) else val
+
+        def __sub__(self, other):
+            return _FakeTensor(self.data - (other.data if isinstance(other, _FakeTensor) else other))
+
+        def __add__(self, other):
+            return _FakeTensor(self.data + (other.data if isinstance(other, _FakeTensor) else other))
+
+        def __mul__(self, other):
+            return _FakeTensor(self.data * (other.data if isinstance(other, _FakeTensor) else other))
+
+        def __rmul__(self, other):
+            return self.__mul__(other)
+
+        def __truediv__(self, other):
+            return _FakeTensor(self.data / (other.data if isinstance(other, _FakeTensor) else other))
+
+    class _NoGrad:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *args):
+            return False
+
+    fake_torch = types.ModuleType("torch")
+    fake_torch.int64 = "int64"
+    fake_torch.float16 = "float16"
+    fake_torch.zeros = lambda *shape, **kw: _FakeTensor(np.zeros(shape, dtype=np.float32))
+    fake_torch.ones = lambda *shape, **kw: _FakeTensor(np.ones(shape, dtype=np.float32))
+    fake_torch.randn = lambda *shape, **kw: _FakeTensor(np.zeros(shape, dtype=np.float32))
+    fake_torch.full = lambda shape, val, **kw: _FakeTensor(np.full(shape, val, dtype=np.float32))
+    fake_torch.tensor = lambda val, **kw: _FakeTensor(np.array(val, dtype=np.float32))
+    fake_torch.from_numpy = lambda arr: _FakeTensor(arr)
+    fake_torch.cat = lambda seq, dim=0: _FakeTensor(np.concatenate([x.data for x in seq], axis=dim))
+    fake_torch.linspace = lambda a, b, steps=10: _FakeTensor(np.linspace(a, b, steps, dtype=np.float32))
+    fake_torch.no_grad = _NoGrad
+    fake_torch.inference_mode = _NoGrad
+
+    fake_F = types.ModuleType("torch.nn.functional")
+    fake_F.interpolate = lambda x, size=1, mode="linear", align_corners=True: _FakeTensor(
+        np.zeros((x.shape[0], x.shape[1], size), dtype=np.float32)
+    )
+    fake_nn = types.ModuleType("torch.nn")
+    fake_nn.functional = fake_F
+    fake_torch.nn = fake_nn
+
+    fake_kaldi = types.ModuleType("torchaudio.compliance.kaldi")
+    fake_kaldi.fbank = lambda wav, **kw: _FakeTensor(
+        np.zeros((max(0, (wav.shape[-1] - 400) // 160 + 1), 80), dtype=np.float32)
+    )
+    fake_comp = types.ModuleType("torchaudio.compliance")
+    fake_comp.kaldi = fake_kaldi
+    fake_ta = types.ModuleType("torchaudio")
+    fake_ta.compliance = fake_comp
+
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "torch.nn", fake_nn)
+    monkeypatch.setitem(sys.modules, "torch.nn.functional", fake_F)
+    monkeypatch.setitem(sys.modules, "torchaudio", fake_ta)
+    monkeypatch.setitem(sys.modules, "torchaudio.compliance", fake_comp)
+    monkeypatch.setitem(sys.modules, "torchaudio.compliance.kaldi", fake_kaldi)
+    monkeypatch.setattr("hth.adapters.meanvc2.worker_process.torch", fake_torch)
+    monkeypatch.setattr("hth.adapters.meanvc2.worker_process.F", fake_F)
+
+    worker = MeanVC2Worker()
+
+    class _FakeASR:
+        def __call__(self, fb, offset, req, att, cnn):
+            return fake_torch.zeros(1, 2, 256), att + 1.0, cnn + 1.0
+
+    class _FakeVC:
+        def __call__(self, x, t, r, cache=None, cond=None, spks=None, offset=0, is_inference=True, kv_cache=None, gtm_kv=None):
+            return fake_torch.zeros(*x.shape), [("k", "v")]
+
+    class _FakeVocoder:
+        def decode(self, mel):
+            return fake_torch.zeros(1, 1, mel.shape[-1] * 160)
+
+    class _Runner:
+        device = "cpu"
+        asr_device = "cpu"
+        asr_scalar_device = "cpu"
+        asr = _FakeASR()
+        vc = _FakeVC()
+        vocoder = _FakeVocoder()
+        _kaldi = fake_kaldi
+        vc_spk_emb = fake_torch.ones(1, 256)
+        vc_gtm_kv = (fake_torch.zeros(1, 32, 256), fake_torch.zeros(1, 32, 256))
+        variant = "40ms"
+        n_steps = 1
+        use_fp16 = False
+        chunk_size = 4
+        block_size = 4
+        CHUNK = 2560
+        _bn_window = 11
+        _bn_stride = 8
+        _required_cache_size = 4
+        _asr_offset_init = 4
+        _asr_offset_step = 2
+        vocoder_overlap = 2
+        upsample_factor = 160
+        vocoder_wav_overlap = 160
+        vocoder_wav_pad = 0
+        down_linspace = fake_torch.linspace(1, 0, steps=160)
+        up_linspace = fake_torch.linspace(0, 1, steps=160)
+        _min_bn_len = 8
+        _req_cache_tensor = fake_torch.tensor(4, dtype="int64")
+
+    worker._runner = _Runner()
+    worker._init_cache()
+    r = worker._runner
+    r.asr_offset = 2500
+    r.vc_offset = 1800
+    r.vc_kv_cache = [("old_k", "old_v")]
+    r.asr_att_cache.fill_(3.0)
+
+    silent_80 = np.zeros(1280, dtype=np.float32)
+    r.asr_offset = 2500
+    r.vc_offset = 1800
+    r.vc_kv_cache = [("old_k", "old_v")]
+    r._silent_streak = 0
+    for _ in range(3):
+        worker.process_chunk(silent_80)
+    assert r.vc_offset >= 1800  # < 4 chunks (320ms) hasn't reset yet
+    worker.process_chunk(silent_80)
+    assert r.asr_offset < 100
+    assert r.vc_offset < 100
+    assert r.vc_kv_cache != [("old_k", "old_v")]
+
 
 
 

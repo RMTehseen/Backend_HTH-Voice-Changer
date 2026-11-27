@@ -71,6 +71,7 @@ class MeanVC2VoiceAdapter:
         self._worker_ready = asyncio.Event()
         self._worker_loaded = asyncio.Event()
         self._worker_target_set = asyncio.Event()
+        self._applied_profile_id: Optional[str] = None
 
         # Audio I/O queues (bounded)
         self._input_queue: Deque[np.ndarray] = collections.deque(maxlen=self._cfg.max_input_queue)
@@ -82,10 +83,10 @@ class MeanVC2VoiceAdapter:
         self._telemetry_queues: set[asyncio.Queue[dict[str, Any]]] = set()
         self._last_telemetry_ts: float = 0.0
         self._inflight_chunks: int = 0
-        # 8 × 80ms = 640ms burst tolerance without multi-second lag accumulation
-        self._max_inflight_chunks: int = 8
+        # 12 × 160ms = ~1.9s burst tolerance during warmup/network spikes without dropping phrase starts
+        self._max_inflight_chunks: int = 12
         self._last_stderr_tail: Deque[str] = collections.deque(maxlen=10)
-        self._processing_mode: str = "pure_neural"  # "pure_neural" | "hybrid" | "bypass"
+        self._processing_mode: str = "hybrid"  # "hybrid" (Neural + Calibrated Age/Vocal DSP) | "pure_neural" | "bypass"
         from .dsp_effects import DSPPostProcessor
         self._remote_dsp = DSPPostProcessor()
 
@@ -463,11 +464,13 @@ class MeanVC2VoiceAdapter:
 
             # 4. Load model if not loaded
             if not self._worker_loaded.is_set():
+                self._applied_profile_id = None
                 await self._load_model()
 
-            # 5. Apply target speaker
+            # 5. Apply target speaker (always re-apply if user switched profile while IDLE)
             if self._active_profile_id not in ("clean-mic", "bypass"):
-                if not self._worker_target_set.is_set():
+                if self._applied_profile_id != self._active_profile_id or not self._worker_target_set.is_set():
+                    self._worker_target_set.clear()
                     await self._apply_profile(self._active_profile_id)
 
             # Reset caches
@@ -553,6 +556,7 @@ class MeanVC2VoiceAdapter:
             raise RuntimeError("Target speaker embedding extraction timed out (60s)")
         if self._state == EngineState.ERROR:
             raise RuntimeError(f"Setting target speaker failed: {self._last_error}")
+        self._applied_profile_id = profile_id
 
     async def _watchdog_loop(self) -> None:
         """Verify worker responsiveness; fail-closed mute on heartbeat timeout."""
@@ -565,6 +569,9 @@ class MeanVC2VoiceAdapter:
                 idle_s = time.monotonic() - self._last_worker_activity
                 if idle_s < timeout_s:
                     continue
+                if not self._worker_target_set.is_set() and self._active_profile_id not in ("clean-mic", "bypass", None):
+                    # Target speaker embedding extraction is in progress; don't ping-kill mid-extraction
+                    continue
                 sent_at = time.monotonic()
                 ok = await self.ping()
                 if not ok:
@@ -573,7 +580,7 @@ class MeanVC2VoiceAdapter:
                     self._state = EngineState.ERROR
                     logger.error("Watchdog ping failed", error=self._last_error)
                     break
-                await asyncio.sleep(3.0)
+                await asyncio.sleep(8.0)
                 if self._state == EngineState.RUNNING and self._last_worker_activity < sent_at:
                     self._last_error = "MeanVC2 worker heartbeat timeout — muted fail-closed."
                     self._is_muted = True
@@ -724,6 +731,10 @@ class MeanVC2VoiceAdapter:
         if self._state == EngineState.RUNNING and self._worker_loaded.is_set():
             self._worker_target_set.clear()
             await self._apply_profile(profile_id)
+        elif self._applied_profile_id != profile_id:
+            # Clear target flag so the next start() applies the newly selected profile
+            self._worker_target_set.clear()
+            self._applied_profile_id = None
         logger.info("Voice profile selected", profile_id=profile_id)
 
     async def panic_mute(self) -> None:

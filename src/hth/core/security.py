@@ -117,23 +117,23 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         import os
-        if os.environ.get("HTH_CLOUD_MODE", "false").lower() in ("true", "1"):
-            return await call_next(request)
+        is_cloud_mode = os.environ.get("HTH_CLOUD_MODE", "false").lower() in ("true", "1")
 
-        # --- Host validation (DNS Rebinding prevention) ---
-        host = request.headers.get("host", "").strip()
-        if not host:
-            return JSONResponse(
-                {"code": "FORBIDDEN", "message": "Host header required"},
-                status_code=403,
-            )
+        # --- Host validation (DNS Rebinding prevention in local mode) ---
+        if not is_cloud_mode:
+            host = request.headers.get("host", "").strip()
+            if not host:
+                return JSONResponse(
+                    {"code": "FORBIDDEN", "message": "Host header required"},
+                    status_code=403,
+                )
 
-        host_name = host.split(":")[0]
-        if host_name not in {"127.0.0.1", "localhost"}:
-            return JSONResponse(
-                {"code": "FORBIDDEN", "message": "Host not allowed"},
-                status_code=403,
-            )
+            host_name = host.split(":")[0]
+            if host_name not in {"127.0.0.1", "localhost"}:
+                return JSONResponse(
+                    {"code": "FORBIDDEN", "message": "Host not allowed"},
+                    status_code=403,
+                )
 
         # --- Origin validation ---
         origin = request.headers.get("origin", "").strip()

@@ -232,6 +232,49 @@ def test_cors_configuration_never_wildcard_credentials() -> None:
     assert set(origins) == set(ALLOWED_ORIGINS)
 
 
+@pytest.mark.asyncio
+async def test_cloud_mode_still_enforces_origin_and_session_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """In HTH_CLOUD_MODE=true, tunnel Host varies, but Origin and X-HTH-Token MUST still be enforced."""
+    monkeypatch.setenv("HTH_CLOUD_MODE", "true")
+    app = create_app()
+    transport = ASGITransport(app=app)
+    token = get_settings().session_token
+
+    async with AsyncClient(transport=transport, base_url="https://demo-tunnel.trycloudflare.com") as client:
+        # 1. Evil origin must be rejected even in cloud mode
+        bad_origin = await client.get(
+            "/api/v1/auth/check",
+            headers={
+                "Host": "demo-tunnel.trycloudflare.com",
+                "Origin": "https://evil-attacker.example",
+                "X-HTH-Token": token,
+            },
+        )
+        assert bad_origin.status_code == 403
+
+        # 2. Missing session token must be rejected with 401 even in cloud mode
+        no_tok = await client.get(
+            "/api/v1/auth/check",
+            headers={
+                "Host": "demo-tunnel.trycloudflare.com",
+                "Origin": "http://127.0.0.1:5173",
+            },
+        )
+        assert no_tok.status_code == 401
+
+        # 3. Approved origin + valid token succeeds
+        ok_resp = await client.get(
+            "/api/v1/auth/check",
+            headers={
+                "Host": "demo-tunnel.trycloudflare.com",
+                "Origin": "http://127.0.0.1:5173",
+                "X-HTH-Token": token,
+            },
+        )
+        assert ok_resp.status_code == 200
+        assert ok_resp.json() == {"ok": True, "authenticated": True}
+
+
 def test_logging_redaction_sanitizes_ws_ticket() -> None:
     """Task 2 & 3: Verifies robust redaction of tickets/tokens across msgs, args, uvicorn, and tracebacks."""
     import io

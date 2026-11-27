@@ -640,6 +640,11 @@ async def websocket_audio_stream(
             msg = await websocket.receive()
             if msg.get("type") == "websocket.disconnect":
                 break
+            text_frame = msg.get("text")
+            if text_frame is not None:
+                if text_frame.strip().lower() == "ping":
+                    await websocket.send_json({"type": "pong"})
+                continue
             data = msg.get("bytes")
             if not data or len(data) > _MAX_AUDIO_WS_FRAME_BYTES or (len(data) % 4) != 0:
                 continue

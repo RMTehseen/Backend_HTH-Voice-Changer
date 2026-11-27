@@ -85,8 +85,13 @@ async def dev_bootstrap_ticket(request: Request, response: Response) -> dict[str
     Sets the HttpOnly SameSite=Strict cookie and returns the active session token
     for in-memory closure storage, eliminating any need to publish credentials in URLs.
     """
+    import os
+    is_cloud_mode = os.environ.get("HTH_CLOUD_MODE", "false").lower() in ("true", "1")
     origin = request.headers.get("origin", "").strip()
-    if origin not in ("http://127.0.0.1:5173", "http://localhost:5173"):
+    allowed_dev_origins = {"http://127.0.0.1:5173", "http://localhost:5173"}
+    if is_cloud_mode:
+        allowed_dev_origins.add("http://tauri.localhost")
+    if origin not in allowed_dev_origins:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Development bootstrap is exclusively permitted from the local Vite dev server (127.0.0.1:5173 or localhost:5173)",

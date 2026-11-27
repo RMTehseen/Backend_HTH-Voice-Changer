@@ -38,8 +38,8 @@ class MeanVC2Config:
     model_dir: str = field(default_factory=lambda: os.environ.get("HTH_MEANVC2_MODEL_DIR", _default_model_dir()))
     # MeanVC2 source code directory
     source_dir: str = field(default_factory=_default_source_dir)
-    # Worker process heartbeat timeout (seconds)
-    heartbeat_timeout_s: float = 10.0
+    # Worker process heartbeat timeout (seconds) — generous enough for 1-10h muted pauses & profile loads
+    heartbeat_timeout_s: float = 25.0
     # Maximum input ring buffer depth (chunks)
     max_input_queue: int = 8
     # Maximum output ring buffer depth (chunks)

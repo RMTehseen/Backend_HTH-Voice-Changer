@@ -44,13 +44,11 @@ def create_app() -> FastAPI:
 
     # CORS — added AFTER SecurityMiddleware so that CORSMiddleware is outermost.
     # This guarantees that all responses (including 401/403 security rejections)
-    # contain proper CORS headers for permitted local-first origins.
-    import os
-    is_cloud_mode = os.environ.get("HTH_CLOUD_MODE", "false").lower() in ("true", "1")
+    # contain proper CORS headers for permitted local-first and Tauri origins
+    # even when connecting to a remote Colab GPU tunnel.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[] if is_cloud_mode else sorted(ALLOWED_ORIGINS),
-        allow_origin_regex=r"^https?://.*" if is_cloud_mode else None,
+        allow_origins=sorted(ALLOWED_ORIGINS),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

@@ -82,7 +82,8 @@ class MeanVC2VoiceAdapter:
         self._telemetry_queues: set[asyncio.Queue[dict[str, Any]]] = set()
         self._last_telemetry_ts: float = 0.0
         self._inflight_chunks: int = 0
-        self._max_inflight_chunks: int = 20
+        # 8 × 80ms = 640ms burst tolerance without multi-second lag accumulation
+        self._max_inflight_chunks: int = 8
         self._last_stderr_tail: Deque[str] = collections.deque(maxlen=10)
         self._processing_mode: str = "pure_neural"  # "pure_neural" | "hybrid" | "bypass"
         from .dsp_effects import DSPPostProcessor

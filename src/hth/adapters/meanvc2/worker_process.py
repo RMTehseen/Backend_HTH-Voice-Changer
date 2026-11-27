@@ -359,12 +359,11 @@ class MeanVC2Worker:
                 bn = torch.cat([r.encoder_output_cache, bn], dim=1)
             r.encoder_output_cache = bn[:, -1:, :]
 
-            # Scale interpolated mel frames cleanly to actual ASR output count
-            # (40ms model: 1 ASR interval = 80ms = 8 mel frames; 120ms model: 16 mel frames).
-            # Supports both 80ms (1280 samples) and 160ms (2560 samples) mic chunks with 1:1 timing.
-            frames_per_asr_step = 16 if getattr(r, "variant", "40ms") == "120ms" else 8
+            # fastu2pp_80ms & fastu2pp_160ms ALWAYS emit BN frames at 40ms/frame (4x mel upsample).
+            # 80ms input emits 2 BN frames (bn.shape[1] == 3 with cache); 160ms emits 4 (shape[1] == 5).
+            # Always scale by 4 * (bn.shape[1] - 1) so output duration strictly matches input 1:1.
             if bn.shape[1] >= 2:
-                vc_chunk = frames_per_asr_step * (bn.shape[1] - 1)
+                vc_chunk = 4 * (bn.shape[1] - 1)
                 bn_up = bn.transpose(1, 2)
                 bn_up = F.interpolate(bn_up, size=vc_chunk + 1,
                                       mode='linear', align_corners=True)
@@ -383,8 +382,8 @@ class MeanVC2Worker:
         else:
             r.bn_buffer = torch.cat([r.bn_buffer, bn_new], dim=1)
 
-        # Cap BN buffer generously to absorb internet burst packets without eating words
-        MAX_BN_FRAMES = 128
+        # Bound BN buffer to 48 frames (480ms) so latency stays real-time after network jitter
+        MAX_BN_FRAMES = 48
         if r.bn_buffer.shape[1] > MAX_BN_FRAMES:
             r.bn_buffer = r.bn_buffer[:, -MAX_BN_FRAMES:, :]
 

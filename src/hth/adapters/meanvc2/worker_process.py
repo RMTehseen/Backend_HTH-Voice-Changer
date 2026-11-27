@@ -329,10 +329,15 @@ class MeanVC2Worker:
 
             r.samples_cache = padded[160 * fbanks.shape[0]:]
 
+            chunk_silent = bool(float(np.sqrt(np.mean(samples * samples))) < 0.005)
             if r.frame_cache is not None:
                 fbanks = torch.cat([r.frame_cache, fbanks], dim=0)
 
-            if r.asr_offset >= 4000:
+            if r.asr_offset >= 2000 and chunk_silent:
+                # Reset ASR offset during quiet pauses so long 15-60 min calls never wrap mid-word.
+                cache_t = r.asr_att_cache.size(2) if r.asr_att_cache.dim() > 0 else 0
+                r.asr_offset = cache_t
+            elif r.asr_offset >= 4000:
                 cache_t = r.asr_att_cache.size(2) if r.asr_att_cache.dim() > 0 else 0
                 r.asr_offset = max(cache_t, r.asr_offset - 4000)
 
@@ -386,8 +391,8 @@ class MeanVC2Worker:
         else:
             r.bn_buffer = torch.cat([r.bn_buffer, bn_new], dim=1)
 
-        # Bound BN buffer to 48 frames (480ms) so latency stays real-time after network jitter
-        MAX_BN_FRAMES = 48
+        # Bound BN buffer to 64 frames (640ms) for 160ms chunks so fluent phrases stay intact
+        MAX_BN_FRAMES = 64
         if r.bn_buffer.shape[1] > MAX_BN_FRAMES:
             r.bn_buffer = r.bn_buffer[:, -MAX_BN_FRAMES:, :]
 
@@ -418,7 +423,9 @@ class MeanVC2Worker:
                     x[:, :r.block_size, :] = r.noise_cache
                 r.noise_cache = x[:, -r.block_size:, :].clone()
 
-                if r.vc_offset >= 4000:
+                if (r.vc_offset >= 1600 and chunk_silent) or r.vc_offset >= 4000:
+                    # Reset DiT KV cache on silent pauses after ~16s so 15-60 min sessions
+                    # never hit the 40s hard cap mid-sentence.
                     r.vc_offset = 0
                     r.vc_kv_cache = None
 

@@ -31,6 +31,9 @@ class DSPPostProcessor:
         self._delay_buf = np.zeros(chunk_size, dtype=np.float32)
         self._grain_size = 400  # 25ms @ 16kHz
         self._window = np.hanning(self._grain_size).astype(np.float32)
+        # State persisted across chunks so filters never click at chunk boundaries
+        self._prev_tilt_sample: float = 0.0
+        self._prev_lp_sample: float = 0.0
 
     def process(
         self,
@@ -80,14 +83,25 @@ class DSPPostProcessor:
             mask = weight > 1e-4
             out[mask] = resampled[mask] / weight[mask]
 
-        # 2. Timbre / Formant Tilt Filter (vectorized, zero-loop)
+        # 2. Timbre / Formant Tilt Filter (chunk-continuous zero-click pre-emphasis/warmth)
         if abs(timbre_ratio - 1.0) >= 0.02:
-            alpha = float(np.clip((timbre_ratio - 1.0) * 0.6, -0.65, 0.65))
-            shifted = self._delay_buf if n_samples == self.chunk_size else np.empty_like(out)
-            shifted[0] = 0.0
+            alpha = float(np.clip((timbre_ratio - 1.0) * 0.5, -0.55, 0.55))
+            shifted = self._delay_buf[:n_samples] if n_samples <= self.chunk_size else np.empty_like(out)
+            shifted[0] = self._prev_tilt_sample
             if n_samples > 1:
                 shifted[1:] = out[:-1]
+            self._prev_tilt_sample = float(out[-1])
             out -= alpha * shifted
+        else:
+            self._prev_tilt_sample = float(out[-1])
+
+        # Gentle 1-pole de-harshing filter (softens sharp "agentic" high-freq sibilance)
+        lp_out = out.copy()
+        prev_lp = self._prev_lp_sample
+        out[0] = 0.88 * lp_out[0] + 0.12 * prev_lp
+        if n_samples > 1:
+            out[1:] = 0.88 * lp_out[1:] + 0.12 * lp_out[:-1]
+        self._prev_lp_sample = float(lp_out[-1])
 
         # 3. Sound Effect Presets
         if sound_effect == "room":
@@ -121,10 +135,11 @@ class DSPPostProcessor:
             diff = np.diff(out, prepend=out[0])
             out = np.clip(diff * 2.8, -0.65, 0.65)
 
-        # 4. Volume Gain & Soft Limiting
-        if volume_gain != 1.0:
+        # 4. Transparent Linear Volume Gain & Peak Protection (no full-range tanh squash)
+        if abs(volume_gain - 1.0) > 0.02:
             out *= volume_gain
 
-        # Soft limiter (tanh knee) to prevent digital harsh clipping
-        np.tanh(out, out=out)
+        peak = float(np.abs(out).max())
+        if peak > 0.95:
+            out = (out * (0.95 / peak)).astype(np.float32)
         return out

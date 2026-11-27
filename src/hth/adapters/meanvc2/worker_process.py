@@ -131,6 +131,10 @@ class MeanVC2Worker:
         _emit({"event": "progress", "step": "loading_asr"})
         asr = torch.jit.load(asr_ckpt, map_location="cpu")
         asr.eval()
+        try:
+            asr = torch.jit.optimize_for_inference(asr)
+        except Exception:
+            pass
 
         # VC model
         _emit({"event": "progress", "step": "loading_vc"})
@@ -390,9 +394,15 @@ class MeanVC2Worker:
         if r.bn_buffer.shape[1] < r._min_bn_len:
             return None
 
-        # VC + Vocoder
-        wav_parts = []
+        # VC steps (batch mel segments across sub-steps so Vocos runs ONCE per chunk)
+        mel_parts = []
         max_steps = 8
+        inference_ctx = getattr(torch, "inference_mode", torch.no_grad)
+        amp_ctx = (
+            torch.amp.autocast("cuda", dtype=torch.float16)
+            if getattr(r, "use_fp16", False)
+            else contextlib.nullcontext()
+        )
         for _ in range(max_steps):
             if r.bn_buffer.shape[1] < r._min_bn_len:
                 break
@@ -402,12 +412,6 @@ class MeanVC2Worker:
             # === VC step (1-step CFM + CUDA FP16 Tensor Core autocast) ===
             N = getattr(r, "n_steps", 1)
             dt = 1.0 / N
-            inference_ctx = getattr(torch, "inference_mode", torch.no_grad)
-            amp_ctx = (
-                torch.amp.autocast("cuda", dtype=torch.float16)
-                if getattr(r, "use_fp16", False)
-                else contextlib.nullcontext()
-            )
             with inference_ctx(), amp_ctx:
                 x = torch.randn(1, cond.shape[1], 80, device=r.device, dtype=cond.dtype)
                 if r.noise_cache is not None:
@@ -435,33 +439,31 @@ class MeanVC2Worker:
                         r.vc_kv_cache = tmp_kv
 
                 r.vc_offset += r.chunk_size
-                mel = x[:, :r.chunk_size, :].transpose(1, 2)
+                mel_parts.append(x[:, :r.chunk_size, :].transpose(1, 2).float())
 
-            # === Vocoder (TorchScript runs reliably in fp32 with cuDNN enabled) ===
-            with inference_ctx():
-                if r.vocoder_cache is not None:
-                    mel = torch.cat([r.vocoder_cache, mel.float()], dim=-1)
-                else:
-                    mel = mel.float()
-                r.vocoder_cache = mel[:, :, -r.vocoder_overlap:]
-                mel_in = (mel + 1) / 2
-                if r.device == "cuda":
-                    mel_in = mel_in.to(r.device, non_blocking=True)
-                wav = r.vocoder.decode(mel_in).squeeze().detach().cpu().numpy()
-                if r.last_wav is not None:
-                    wav = wav[r.vocoder_wav_pad:]
-                    front = wav[:r.vocoder_wav_overlap]
-                    smooth = (r.last_wav * r.down_linspace.numpy()
-                              + front * r.up_linspace.numpy())
-                    new_wav = np.concatenate([smooth, wav[r.vocoder_wav_overlap:-r.vocoder_wav_overlap]])
-                else:
-                    new_wav = wav[:-r.vocoder_wav_overlap]
-                r.last_wav = wav[-r.vocoder_wav_overlap:]
-            wav_parts.append(new_wav)
-
-        if not wav_parts:
+        if not mel_parts:
             return None
-        out_wav = np.concatenate(wav_parts)
+
+        # === Single batched Vocoder pass (cuts CUDA kernel launches & CPU syncs in half) ===
+        with inference_ctx():
+            mel = torch.cat(mel_parts, dim=-1) if len(mel_parts) > 1 else mel_parts[0]
+            if r.vocoder_cache is not None:
+                mel = torch.cat([r.vocoder_cache, mel], dim=-1)
+            r.vocoder_cache = mel[:, :, -r.vocoder_overlap:]
+            mel_in = (mel + 1) / 2
+            if r.device == "cuda":
+                mel_in = mel_in.to(r.device, non_blocking=True)
+            wav = r.vocoder.decode(mel_in).squeeze().detach().cpu().numpy()
+            if r.last_wav is not None:
+                wav = wav[r.vocoder_wav_pad:]
+                front = wav[:r.vocoder_wav_overlap]
+                smooth = (r.last_wav * r.down_linspace.numpy()
+                          + front * r.up_linspace.numpy())
+                out_wav = np.concatenate([smooth, wav[r.vocoder_wav_overlap:-r.vocoder_wav_overlap]])
+            else:
+                out_wav = wav[:-r.vocoder_wav_overlap]
+            r.last_wav = wav[-r.vocoder_wav_overlap:]
+
         if not np.isfinite(out_wav).all():
             out_wav = np.nan_to_num(out_wav, nan=0.0, posinf=0.98, neginf=-0.98)
         return np.clip(out_wav, -0.98, 0.98).astype(np.float32)
